@@ -446,3 +446,192 @@ pyAudioAnalysis | LOW    | LOW    | LOW   | R&D lab
 ```
 
 **Do this order.** Phase 1 alone (openSMILE + WhisperX + existing VAD/turns) gives manager-useful outputs without any emotion model.
+
+---
+
+## Why This Spec Over Alternatives
+
+There are roughly four schools of thought for audio-based call analysis. Here is why this spec opposes each of them.
+
+### Alternative A: "Just fine-tune a big model"
+
+**Claim:** Fine-tune Whisper or Qwen on call audio + manager scores. One model does everything.
+
+**Why this spec disagrees:**
+- Fine-tuning gives you a black box. When it says "confidence: 73%", you cannot explain why. A manager cannot act on that.
+- Fine-tuning requires 1000s of labelled calls *before you have any labelled calls*. Chicken-and-egg problem.
+- Audio foundation models drift across audio formats, microphone quality, background noise. Your fine-tune breaks on the first Teams call recording.
+- You cannot separate "the model is bad at transcription" from "the model is bad at emotion" from "the rubric is wrong." Debugging is hell.
+
+**This spec instead:** Extract *transparent signals* (pause length, pitch variability, filler count, response latency) that can be individually validated against ground truth. The LLM interprets the signals, not the raw audio. Each signal is independently testable.
+
+### Alternative B: "Use a commercial emotion API"
+
+**Claim:** Azure Emotion API / Hume AI / audEERING DEVAICE handles everything.
+
+**Why this spec disagrees:**
+- API cost at scale: $0.001–0.01 per API call × millions of calls = significant.
+- Vendor lock-in. If Hume changes their model or pricing, your analysis changes.
+- API responses are black boxes — you get JSON scores with no explanation of what audio features drove them.
+- Privacy: sending call audio to third-party APIs is a non-starter for enterprise MSPs handling PII.
+- The good APIs (Hume, audEERING) are research-only licensed or expensive.
+
+**This spec instead:** Open-source tools (openSMILE, WhisperX, emotion2vec) run on your own infra. Zero data leaves your environment. Each feature extraction step is auditable.
+
+### Alternative C: "Just use the LLM — GPT-4o can analyse audio directly"
+
+**Claim:** GPT-4o / Gemini can listen to audio and write analysis. No pipeline needed.
+
+**Why this spec disagrees:**
+- Cost: 1 minute of audio input via GPT-4o audio modality is ~$0.10. A 10-minute call = $1.00 per analysis. At 1000 calls/month = $1000/mo just for audio processing.
+- Latency: 10+ seconds per analysis. Cannot scale to batch.
+- No structured output guarantee. The LLM might say "the candidate sounded confident" one day and "the candidate seemed assertive" the next for the same audio.
+- No repeatability. Run the same audio twice → two different analyses. Managers cannot trust this.
+- Hallucination: LLMs invent acoustic detail that does not exist ("I detected a slight tremor in the voice" when there was none).
+
+**This spec instead:** Objective feature extraction (deterministic, repeatable) + LLM interpretation of the feature vector (constrained, verifiable). The LLM sees `[pause_avg_ms: 1200, pitch_std: 24Hz, filler_count: 7]`, not raw audio. Its output can be validated against the input features.
+
+### Alternative D: "Build on top of a conversational AI platform"
+
+**Claim:** Use Rasa / Voiceflow / Cognigy for the voice agent, bolt on analysis.
+
+**Why this spec disagrees:**
+- Those platforms are designed for building conversational AI, not analysing it. Their analytics are dashboards and logs, not acoustic feature extraction.
+- They do not compute jitter, shimmer, eGeMAPS, or word-level timing.
+- You export a transcript and lose all acoustic information.
+- Platform lock-in again.
+
+**This spec instead:** Audiator is purpose-built for analysis from day one. The feature extraction pipeline is the product, not an afterthought bolted onto a conversational platform.
+
+### Summary of Differentiation
+
+| Concern | Alternative Approaches | This Spec |
+|---------|----------------------|-----------|
+| Explainability | Black box (fine-tuned model, API, LLM) | Each signal traceable to specific acoustic feature |
+| Cost at scale | $0.01–$0.10 per call (API/LLM audio) | ~$0.001 per call (open-source inference) |
+| Privacy | Audio leaves your infra | All processing local |
+| Repeatability | Non-deterministic (LLM, API model updates) | Deterministic feature extraction |
+| Debuggability | Cannot tell why a score was wrong | Each feature independently testable |
+| Data moat | Model vendor owns the fine-tune | Your manager feedback + rubric = your moat |
+| Time to value | Requires labelled data first | Works with zero labelled data (Phase 1) |
+
+---
+
+## Where I Am Not Sure / Would Test Multiple Approaches
+
+The spec above is my best judgment. These are the areas where I am genuinely uncertain and recommend running experiments rather than committing early.
+
+### 1. WhisperX vs SenseVoice for ASR + Timing
+
+**The question:** Should Phase 1 use WhisperX (GPU-accelerated, word-level alignment, pyannote diarization) or SenseVoice (CPU-capable via GGUF, 15x faster, built-in emotion + audio events)?
+
+**Why I am not sure:**
+- WhisperX is the gold standard for word-level timing. But it needs GPU for reasonable speed.
+- SenseVoice on llama.cpp/GGUF runs CPU-only with no Python runtime — vastly simpler deployment.
+- If SenseVoice's word timing is accurate enough, it could skip WhisperX entirely and also provide emotion tags as a side effect.
+- But SenseVoice's emotion tags are discrete (happy/sad/angry) which conflicts with our "no emotion labels" framing.
+
+**Test:** Take 20 MSP call recordings (5 minutes each). Run through both pipelines. Compare:
+- Word-level timestamp accuracy (manually check 100 random words per call)
+- Transcription WER
+- Processing time
+- For SenseVoice: are the emotion tags consistent with human labelling?
+
+**If SenseVoice wins:** Replace WhisperX entirely. Get ASR + emotion + audio events in one CPU-capable pipeline.
+**If WhisperX wins:** Keep WhisperX for ASR/timing. Ignore SenseVoice until Phase 3 experiment.
+
+### 2. openSMILE vs Parselmouth for Prosody/Voice Quality
+
+**The question:** Which should be the primary prosody extractor?
+
+**Why I am not sure:**
+- openSMILE is faster and its eGeMAPS feature set is the affective computing standard. But its jitter/shimmer algorithms may differ from Praat's.
+- Parselmouth (Praat bindings) is the phonetic gold standard — if a feature claims "high jitter", Praat's measurement is more defensible in a scientific sense.
+- However, Parselmouth is slower and covers less ground (no eGeMAPS/ComParE).
+- The question is: do managers care about phonetic validity or broad coverage?
+
+**Test:** Run both on 50 candidate utterances. Compare jitter, shimmer, HNR, pitch values. Are they correlated? Do they produce the same "hesitation" classification? Which is faster?
+
+**Suspicion:** openSMILE is good enough and covers more features. Parselmouth adds marginal value. But if domain experts (speech therapists, phoneticians) are involved in validation, Parselmouth's Praat provenance matters.
+
+### 3. Should We Build a Trainable Layer at All?
+
+**The question:** Given that Phase 1 works with zero training data, is Phase 4's trainable classifier worth the complexity?
+
+**Why I am not sure:**
+- The LLM interpretation layer might be good enough. If GPT-4o-mini can write a sensible "candidate hesitated because [pause=1.2s, filler=5, pitch_rise=yes]" from feature vectors alone, manager-labelled training data might not improve things much.
+- Training a classifier introduces model versioning, data drift, and calibration complexity.
+- However, the LLM will not get better over time. A trained classifier improves with every manager rating.
+
+**Test:** Run Phase 1 for 100 calls. Have managers rate each analysis as accurate/inaccurate/hallucinated. If >80% are rated accurate, defer Phase 4. If <60%, build the classifier.
+
+**Risk:** The classifier makes the system harder to explain. The beauty of Phase 1 is that every output is traceable to a measured feature. A trained model re-introduces opacity.
+
+### 4. audEERING ADV vs Nothing at All
+
+**The question:** Do arousal/dominance/valence estimates actually improve manager decision-making?
+
+**Why I am not sure:**
+- Phase 1's signals (pause length, WPM, fillers, pitch variability, silence ratio) already cover most of what managers care about.
+- "Arousal: 0.61" adds a single number that managers may not know how to act on.
+- If the ADV model disagrees with the prosodic signals (e.g., low arousal but high pitch variability), which does the manager trust?
+
+**Test:** Show managers two versions of the same analysis — one with ADV scores, one without. Ask: does the ADV version change your assessment of the candidate? Does it help you write feedback?
+
+**Suspicion:** ADV will matter most for edge cases — candidates who seem calm (low pitch variability, moderate latency) but have high arousal (ADV model detects tension). This might be the "hiding panic" signal. But I am not confident.
+
+### 5. pyannote Diarization vs sherpa-onnx vs Known Turn Log
+
+**The question:** We already know who spoke when from the sim engine's turn log. Do we need any diarization at all, or does the acoustic diarization add cross-validation value?
+
+**Why I am not sure:**
+- For audiator's current use case (known agent/customer turns), diarization is redundant.
+- But if audiator is used on real call recordings (where turn log is unknown), diarization becomes essential.
+- sherpa-onnx (current) works CPU but is less accurate. pyannote is more accurate but needs GPU.
+- The question is: do we build for the current use case or for future generality?
+
+**Test:** Run 20 mixed-call recordings through all three approaches. Compare:
+- sherpa-onnx vs pyannote accuracy (how well do they reconstruct the known turn log?)
+- Processing time difference
+- Does diarization accuracy affect downstream metrics (response latency, talk ratio)?
+
+**Suspicion:** sherpa-onnx is good enough for the known-turn-log case. Switch to pyannote only when processing unknown recordings becomes a requirement.
+
+### 6. Feature Set Size: eGeMAPS (88) vs ComParE (6373)
+
+**The question:** Do we need all 6373 ComParE features, or is eGeMAPS sufficient?
+
+**Why I am not sure:**
+- eGeMAPS (88 features) was specifically designed to be minimal but sufficient for affective computing. It is more interpretable and less prone to overfitting.
+- ComParE (6373 features) captures everything but is heavily redundant. Most papers using ComParE apply feature selection.
+- For Phase 1, eGeMAPS is the right choice. But if the MLP in Phase 4 underperforms, a larger feature set (ComParE + feature selection) might unlock better accuracy.
+
+**Test:** After Phase 4's classifier is trained on eGeMAPS, re-run with ComParE + mutual-information feature selection. Compare accuracy.
+
+**Suspicion:** eGeMAPS will be 90% as good as ComParE for call centre audio. The gap is not worth the interpretability cost.
+
+### 7. LLM Provider: OpenRouter GPT-4o-mini vs Local Model
+
+**The question:** Should the LLM interpretation layer use a hosted model (OpenRouter) or a local model (Qwen 2.5 7B via Ollama)?
+
+**Why I am not sure:**
+- OpenRouter GPT-4o-mini is cheap ($0.15/1M input tokens) and high quality. But it requires internet and API key.
+- Qwen 2.5 7B local is free, private, and always available. But quality is lower and hardware requirements are higher.
+- The interpretation task is simple: "Given these feature values, write a paragraph." Both models can do this.
+- The risk with hosted models: they change, deprecate, or increase pricing.
+
+**Test:** Feed the same feature vectors to both models. Run 50 comparisons. Which produces more manager-useful narratives? Are there systematic differences (e.g., GPT-4o-mini is more cautious, Qwen is more definitive)?
+
+**Suspicion:** Start with OpenRouter GPT-4o-mini (best quality, zero ops burden). Add Qwen as fallback/offline option in Phase 3.
+
+### Summary of Uncertainties
+
+| Question | Test | Decision Point |
+|----------|------|----------------|
+| WhisperX vs SenseVoice | 20 calls, compare timing accuracy + WER + speed | End of Phase 1 |
+| openSMILE vs Parselmouth | 50 utterances, compare jitter/shimmer correlation | End of Phase 1 |
+| Trainable layer needed? | 100 calls, manager satisfaction survey | Before Phase 4 |
+| ADV value-add | Manager A/B test with/without ADV scores | End of Phase 2 |
+| pyannote vs sherpa-onnx | 20 mixed recordings, diarization accuracy | When unknown recordings are needed |
+| eGeMAPS vs ComParE | Compare classifier accuracy after Phase 4 training | During Phase 4 |
+| LLM provider | 50 comparisons, narrative quality | Before production deployment |
