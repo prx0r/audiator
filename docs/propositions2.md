@@ -296,15 +296,292 @@ This architecture proves five things at once:
 
 ---
 
-## What Not to Do
+## Failure Modes & Fixes
 
-| Trap | Why |
+*The graph-prediction/cache approach is powerful but has sharp edges. Humans constantly add unexpected social, emotional, ambiguous, or meta-level behaviour. The system must be fast when the candidate stays on-path but graceful when they go off-path.*
+
+### 1. Premature Commitment
+
+**Problem:** The system may predict correctly at word 5 but miss the final meaning at word 12.
+
+Candidate: *"Can you check if the internet is working… or actually, can you just restart the router?"*
+
+Early prediction: `ask_internet_status`. Final intent: `bad_action_restart_router_too_early`.
+
+**Fix:** Never commit during speech. Only **speculate** during speech. Hard-commit after VAD/end-of-speech and final transcript.
+
+```
+0.30–0.60 confidence: preload broad branch
+0.60–0.85 confidence: preload likely node
+0.85+ confidence: prepare response in buffer
+After final transcript: commit with threshold check
+```
+
+### 2. Multi-Intent Utterances
+
+**Problem:** Real speech often bundles multiple actions in one turn.
+
+Candidate: *"Can you check if there's anything in the outbox, and also whether Work Offline is turned on?"*
+
+Graph systems like clean one-node-per-turn logic. Real candidates bundle actions.
+
+**Fix:** Allow one utterance to trigger multiple nodes.
+
+```json
+{
+  "matchedNodes": ["ask_outbox_status", "ask_work_offline_status"],
+  "evidenceTags": ["checked_outbox", "identified_work_offline"],
+  "stateUpdates": [{ "outboxChecked": true }, { "workOfflineFound": true }]
+}
+```
+
+The customer response covers both in a single line: *"Yeah, there are three in the outbox and Work Offline is definitely on."*
+
+### 3. Human Warmth Treated as Noise
+
+**Problem:** Candidates say things like *"Are you okay?"* or *"Don't worry, we'll get this sorted."* A rigid graph may ignore these because they don't advance the technical path. MSP managers care about tone.
+
+**Fix:** Separate **technical graph** from **soft-skill overlay**.
+
+```
+Technical intent: ask_work_offline_status
+Soft-skill modifier: empathy | reassurance | ownership | bad_jargon | dismissive_tone
+```
+
+Response selection becomes: technical response + emotional acknowledgement.
+
+### 4. "Curveball at the End"
+
+**Problem:** Candidate starts *"Can you check if Work Offline is on…"* (system predicts `ask_work_offline_status`), then finishes *"…also, are you okay? You sound stressed."* The candidate did two things: correct diagnostic action + empathy. If the graph only commits to one node, you lose nuance.
+
+Bad: *"Yeah, it is highlighted."* (ignores empathy)
+Better: *"Sorry, I'm just stressed because I've got a meeting soon. And yes, Work Offline is highlighted."*
+
+**Fix:** Support compound intents with primary + secondary.
+
+```json
+{
+  "primaryIntent": "ask_work_offline_status",
+  "secondaryIntent": "show_empathy",
+  "responseKey": "work_offline_plus_acknowledge_stress"
+}
+```
+
+### 5. Cache Combinatorial Explosion
+
+**Problem:** 15 nodes × 8 emotions × 5 candidate tones × 4 personas × 3 urgency levels = thousands of files.
+
+**Fix:** Cache the common spine only. Generate rare blend responses on the fly.
+
+```
+Cached: "Yeah, Work Offline is highlighted."
+Generated on-the-fly: "Sorry, I'm just stressed because I have a meeting soon."
+Combined: Generated emotional prefix + cached technical answer.
+```
+
+### 6. LLM Fallback Ruins Character
+
+**Problem:** When the graph fails and the LLM generates freely, it may give away hidden facts, be too helpful, break persona, or solve the issue for the candidate.
+
+**Fix:** Constrain fallback with scenario state. The LLM receives:
+
+- Allowed facts only
+- Forbidden facts
+- Customer mood
+- What the customer knows/doesn't know
+- Current graph state
+- Response length limit
+
+Output structured JSON, not free text.
+
+### 7. Off-Graph Turns Need Scoring Too
+
+**Problem:** Candidate says *"Are you okay?"* — off the technical graph but still score-relevant. If the system only scores graph progression, it misses important behaviour.
+
+**Fix:** Parallel evaluators:
+
+```
+Technical progression scorer
+Communication scorer
+Call-control scorer
+Professionalism scorer
+Safety/compliance scorer
+```
+
+Route log captures:
+
+```json
+{
+  "technicalIntent": "ask_work_offline_status",
+  "communicationIntent": "empathy_check",
+  "scoreSignals": { "technical": "+1", "empathy": "+1", "callControl": "neutral" }
+}
+```
+
+### 8. Partial Transcript False Positives
+
+**Problem:** Streaming STT is messy. *"work offline"* might arrive as *"walk offline"* or *"work often."* Predictor may preload wrong audio.
+
+**Fix:** Soft prediction during speech. Hard commit only after final transcript. Confidence thresholds prevent premature action.
+
+### 9. System Feels Too Scripted
+
+**Problem:** If every correct action triggers the same canned response, candidates notice repetition.
+
+**Fix:** Cache multiple variants per response (short neutral, frustrated, confused, grateful, rushed) and rotate based on persona/mood.
+
+### 10. Interruptions and Barge-In
+
+**Problem:** Candidate may interrupt customer audio. Playing full cached audio through an interruption feels fake.
+
+**Fix for MVP:** Disable candidate mic while customer speaks.
+**Fix for later:** Allow interruption, stop audio, classify interruption, score call control, respond appropriately.
+
+### 11. Graph Overfits to "Preferred Script"
+
+**Problem:** You know the ideal route, but good support agents solve issues in different valid orders. A narrow graph punishes valid alternative paths.
+
+Candidate checks Work Offline before webmail — that may be fine if the symptom strongly suggests Outlook-specific failure.
+
+**Fix:** Graph nodes represent **competence evidence**, not a single sacred script. Acceptable alternative routes should be explicitly defined. Lower score only for genuinely missing scope, not for reordering.
+
+### 12. "Happy Path" Hides Bad Reasoning
+
+**Problem:** Candidate accidentally hits the right node (e.g., *"Just turn Work Offline off"*) but didn't diagnose properly. The graph marks `resolved issue` but the analysis should notice: jumped to fix, didn't explain, didn't test.
+
+**Fix:** Each node needs quality dimensions: action taken, timing, justification, customer explanation, confirmation, professional phrasing.
+
+### 13. Latency Optimization Fights Realism
+
+**Problem:** 0ms response is not always good. Real call rhythm includes thinking pauses, clicking pauses, searching pauses, confusion pauses.
+
+**Fix:** Use intentional latency based on response type:
+
+```
+Simple answer: 200-500ms
+Customer checking screen: 1-2s
+Customer confused: 700ms + hesitant phrase
+Customer searching menu: 2-4s
+```
+
+### 14. Graph State Inconsistency
+
+**Problem:** Candidate asks *"Is webmail working?"* Customer says *"Yes."* Later candidate asks *"Can you try webmail?"* Bad system may answer *"No, it won't load."*
+
+**Fix:** Scenario state is authoritative. Customer response layer must never contradict it.
+
+```json
+{
+  "webmailWorks": true,
+  "internetWorks": true,
+  "outboxHasItems": true,
+  "workOfflineEnabled": true
+}
+```
+
+### 15. Small Talk Can Derail Assessment
+
+**Problem:** *"Are you okay?"* = empathy (good). *"What are you doing this weekend?"* = time-wasting (bad). The system needs to distinguish empathy from avoidance.
+
+**Fix:** Small talk allowed but bounded by scenario mood. Rushed customer pulls back to task: *"I'm okay, just stressed about this meeting. Can we focus on getting the email sent?"*
+
+---
+
+## The Correct Architecture Is Hybrid
+
+Not pure cached graph. Not pure LLM. A three-layer hybrid:
+
+```
+80% graph/cached response:
+  Candidate says expected thing → play preloaded audio → instant
+
+15% graph + generated modifier:
+  Candidate adds human curveball → generated emotional prefix + cached technical answer
+
+5% full fallback generation:
+  Candidate goes fully off-graph → constrained LLM with scenario state → route back to graph
+```
+
+### Examples
+
+**Candidate says expected thing:**
+> Candidate: "Is Work Offline highlighted?"
+> System: "Yeah, it is highlighted. Is that why the email isn't sending?" (cached)
+
+**Candidate adds human curveball:**
+> Candidate: "Is Work Offline highlighted? Also, are you okay?"
+> System: "Sorry, I'm just stressed about the meeting. And yes, Work Offline is highlighted." (generated prefix + cached core)
+
+**Candidate goes fully off-graph:**
+> Candidate: "Honestly, this sounds like a cursed Outlook goblin situation."
+> System: "I don't really know what that means — I just need to get this email sent." (constrained LLM)
+> Then route back to graph.
+
+### The Main Design Rule
+
+The graph is not a prison. It is the **spine**.
+
+```
+Graph = what must remain true
+LLM = how the customer speaks around it
+Cache = how we make common responses instant
+Scoring = how we interpret the route
+```
+
+When the candidate curveballs, you do not break the sim. You let the LLM handle the social texture, boxed inside the graph state.
+
+---
+
+## Chaos Tester Mode
+
+Feed the same scenario these candidate turns and log the system's behaviour for each:
+
+```
+1. "Are you okay?"
+2. "Sorry, you sound stressed — we'll get it sorted."
+3. "Can you check Work Offline? Also, are you okay?"
+4. "Can you check the outbox and Work Offline?"
+5. "Actually never mind, restart the router."
+6. "Is there a work offline button — wait, what email client are you using?"
+7. "Cool, by the way, where are you based?"
+8. "I'm going to reinstall Outlook."
+9. "Can you try webmail again?"
+10. "I think this is probably DNS."
+```
+
+For each, log:
+
+```
+predicted node(s)
+final committed node(s)
+secondary intents
+customer response selected
+state updates
+score signals
+whether fallback was used
+whether response contradicted scenario state
+```
+
+This immediately shows where the architecture breaks.
+
+---
+
+## Blunt Conclusion
+
+The approach is strong because the scenario is finite and predictable. Its flaws are real but fixable:
+
+| Flaw | Fix |
 |---|---|
-| Word-level TTS streaming | You don't need it. Preloaded audio covers 80%+ of turns. |
-| Full Rasa adoption | Too heavy for MVP. Copy the mental model, not the framework. |
-| LangGraph for live call | Use for Callum/analysis/offline, not the millisecond-sensitive live loop. |
-| GPU inference | Kokoro runs on CPU. Your Hetzner box is enough. |
-| Emotion recognition | You don't need to read emotion. The graph *knows* the customer's scripted emotional state. |
+| Humans speak in compound intents | Support multi-node matching |
+| Humans add empathy and jokes | Separate technical graph + soft-skill overlay |
+| Partial transcripts mislead | Soft speculate, hard commit after VAD |
+| Cached responses feel robotic | Mix generated social wrapper + cached technical spine |
+| Fallback LLM leaks hidden facts | Constrain with scenario state + structured output |
+| Graph overfits to one script | Acceptable alternative routes, competence evidence |
+| Response variants explode | Cache common spine, generate rare blends on the fly |
+| Off-graph behaviour needs scoring | Parallel evaluators (empathy, control, professionalism) |
+
+Build the graph as the spine. Let the LLM handle social texture but box it inside graph state. That gives you speed without brittleness.
 
 ---
 
