@@ -5,26 +5,314 @@
 
 ---
 
-## Architecture
+## Ideal Architecture
+
+### Overview: Two Systems, One Product
+
+Audiator has two tightly coupled systems:
+
+**1. Live Sim Engine** — the real-time conversational AI that plays the customer during a training call. Must be fast, controllable, and scorable.
+
+**2. Analysis Engine** — the offline multi-pass judge that evaluates the candidate after the call. Must be thorough, evidence-backed, and manager-useful.
+
+The critical insight: **these are not separate.** The live sim engine produces structured data that makes the analysis engine dramatically more accurate. And the analysis engine's findings feed back into better sim packs.
+
+---
+
+### Live Sim Engine: Conversation Response Graph
+
+*This is the single most important architectural decision. Stop trying to make the LLM generate every response in real time.*
+
+#### The Core Idea
+
+The manager/Callum creates a sim pack with a scenario, hidden cause, and expected candidate path. That script is compiled into a **Conversation Response Graph** — a directed tree of likely candidate intents, preloaded customer responses, state transitions, and rubric evidence tags.
+
+Before the call even starts, the likely customer responses are pre-generated as audio files. The system does not need to synthesise anything for 80%+ of turns.
+
+#### The Compiled Artefact
 
 ```
-audio file in
-  → Objective Engine (no GPU, deterministic)
-     → transcript + word timestamps
-     → turn timing & response latency
-     → prosody features (pitch, energy, jitter, shimmer)
-     → eGeMAPS/ComParE feature sets
-     → arousal/dominance/valence estimates
-  → Evidence Assembly
-     → candidate-behaviour signals
-     → hesitation/confidence/pressure/interruption markers
-  → LLM Interpretation Layer
-     → manager-readable analysis narrative
-  → Manager Feedback Loop
-     → calibrate + store → retrain lightweight classifier
+SimPackDraft
+  → RuntimeSimPack
+    → ConversationResponseGraph
+      → PreloadedAudioManifest
 ```
 
-**Framing principle:** We do not claim to read "true emotional state." We produce *signals suggesting confidence, hesitation, pressure, interruption, calmness, pace, and customer-handling quality.* That is defensible and manager-useful.
+#### Conversation Response Graph Node
+
+```json
+{
+  "node_id": "outlook_outbox_check",
+  "candidate_intents": [
+    "asks_about_outbox",
+    "asks_if_emails_are_stuck",
+    "asks_where_unsent_emails_are"
+  ],
+  "example_candidate_phrases": [
+    "Are the emails stuck in your Outbox?",
+    "Can you check your Outbox?",
+    "Where are the emails sitting?"
+  ],
+  "customer_responses": [
+    {
+      "mood": "neutral",
+      "text": "Yeah, there are three emails sitting in Outbox.",
+      "audio_cache_key": "outlook_outbox_neutral_v1"
+    },
+    {
+      "mood": "frustrated",
+      "text": "Yeah, there are three stuck there. I really need these sent.",
+      "audio_cache_key": "outlook_outbox_frustrated_v1"
+    }
+  ],
+  "state_update": { "outbox_checked": true },
+  "rubric_evidence": {
+    "positive": ["checked_outbox"],
+    "skill": "basic_email_troubleshooting"
+  },
+  "next_likely_nodes": [
+    "check_internet",
+    "check_work_offline",
+    "send_test_email"
+  ]
+}
+```
+
+#### Preloaded Audio Manifest
+
+```json
+{
+  "sim_pack_id": "outlook_work_offline_v1",
+  "voice_persona": "frustrated_office_manager",
+  "preload_manifest": [
+    {
+      "cache_key": "greeting_frustrated_v1",
+      "text": "Hi, I can't send emails and I've got patients waiting.",
+      "mood": "frustrated",
+      "priority": "high"
+    },
+    {
+      "cache_key": "outbox_checked_frustrated_v1",
+      "text": "Yeah, there are three emails sitting in Outbox.",
+      "mood": "frustrated",
+      "priority": "high"
+    }
+  ]
+}
+```
+
+Before the call, generate and cache all high-priority audio. During the call, playback is instant for matched nodes.
+
+#### Runtime Loop
+
+```
+candidate utterance
+  → classify intent (keyword match → embedding similarity → small LLM)
+  → find matching graph node
+  → if confidence high: play preloaded response, update state, log evidence
+  → if confidence medium: template response from node + state
+  → if confidence low: LLM fallback (rare)
+  → preload next_likely_nodes from current node
+```
+
+#### Three Response Layers
+
+| Layer | Trigger | Latency | % of Turns |
+|-------|---------|---------|------------|
+| **Preloaded exact** | Candidate matches expected intent | ~instant | ~60% |
+| **Template-generated** | Candidate is close but not exact | ~100-300ms | ~25% |
+| **LLM fallback** | Candidate goes off-script | ~800-2000ms | ~15% |
+
+Goal: 80%+ preloaded or template, less than 20% LLM fallback.
+
+#### Intent Classification Strategy (Hybrid)
+
+For MVP, a hybrid classifier:
+
+1. **Keyword/rule match** for obvious patterns (fast, zero model)
+2. **Embedding similarity** against expected candidate phrases (lightweight)
+3. **Small LLM fallback** if uncertain (<20% of turns)
+
+#### How This Creates Difficulty
+
+Same scenario, different graph density:
+
+| Difficulty | Customer Responses | Candidate Burden |
+|-----------|-------------------|-----------------|
+| Beginner | Direct hints: "There's a Work Offline button highlighted" | Low — obvious cues |
+| Intermediate | Vague: "Something's highlighted at the top, not sure what" | Medium — must probe |
+| Advanced | Frustrated: "I don't know where that is, can you be specific?" | High — must manage tone + technique |
+
+#### How This Beats Generic Voice Latency
+
+Cartesia has to handle arbitrary text. Audiator handles only MSP customer turns in a known scenario. That constraint lets us pre-generate, cache, and play instantly. The system *feels* like it is thinking and speaking instantly, but really:
+
+```
+candidate utterance
+  → match against likely intent
+  → play preloaded response (0ms synthesis)
+  → update sim state (no LLM call for ~80% of turns)
+```
+
+---
+
+### Analysis Engine: Offline Multi-Pass Judge
+
+*Post-call. Thorough. Scenario-aware. Leverages everything the live sim engine captured.*
+
+#### The Core Object
+
+```json
+{
+  "scenario_truth": {
+    "hidden_facts": [],
+    "customer_persona": {},
+    "expected_emotional_trajectory": [],
+    "red_flags": [],
+    "ideal_path": []
+  },
+  "customer_state_timeline": [
+    { "timestamp_ms": 0, "state": "frustrated", "hidden_need": "reassurance" },
+    { "timestamp_ms": 12000, "state": "impatient", "trigger": "impact_not_acknowledged" }
+  ],
+  "candidate_behaviour_timeline": [
+    { "timestamp_ms": 5000, "action": "asked_about_error", "technical": true, "social": false },
+    { "timestamp_ms": 25000, "action": "acknowledged_frustration", "technical": false, "social": true }
+  ],
+  "matched_intent_graph": [
+    { "node": "outlook_outbox_check", "matched": true, "timestamp_ms": 14000, "confidence": 0.92 }
+  ],
+  "technical_decisions": [
+    { "action": "checked_webmail", "correct": true, "timestamp_ms": 15000 }
+  ],
+  "communication_decisions": [
+    { "action": "used_jargon", "correct": false, "timestamp_ms": 8000, "note": "said 'OST file' without explanation" }
+  ],
+  "audio_signals": [
+    { "timestamp_ms": 12000, "feature": "pause_before_answer_ms", "value": 2400, "interpretation": "hesitation before impact question" }
+  ],
+  "ticket_note_quality": {
+    "has_hostname": false,
+    "has_impact": true,
+    "has_next_step": true,
+    "missing_fields": ["hostname", "error_message"]
+  },
+  "rubric_evidence": [
+    { "criterion": "identity_check", "status": "verified", "evidence": "\"Can I get your name please?\"" }
+  ],
+  "final_scores": {}
+}
+```
+
+#### Six-Pass Pipeline
+
+```
+Pass 1: Transcript cleanup + turn reconstruction
+        → speaker labels, timing, word alignment
+        → from audio + event log + matched intent graph
+
+Pass 2: Scenario storyline reconstruction
+        → what was the customer's hidden state at each turn?
+        → what was the candidate supposed to discover?
+        → cross-reference against sim pack truth
+
+Pass 3: Candidate action extraction
+        → from event log: tools opened, tickets created, triage performed
+        → from matched intent graph which nodes were hit/missed
+
+Pass 4: Audio/prosody feature extraction
+        → openSMILE eGeMAPS per turn
+        → pause analysis, pitch variability, energy, jitter
+        → correlated against matched intents
+
+Pass 5: Rubric evidence matching
+        → which criteria were met? where is the transcript evidence?
+        → did the candidate miss critical hidden facts?
+        → cross-reference matched graph nodes against rubric
+
+Pass 6: Final manager-readable review
+        → LLM synthesis: features + evidence + graph matches → narrative
+```
+
+#### The Analysis Advantage
+
+Because the live sim engine captured `matched_intent_graph`, the analysis engine does not need to guess what the candidate was doing. It knows:
+
+```json
+{
+  "timestamp": "02:14",
+  "candidate_intent": "asked_about_outbox",
+  "matched_node": "outlook_outbox_check",
+  "rubric_tag": "checked_outbox",
+  "customer_response_variant": "frustrated"
+}
+```
+
+That feeds directly into scoring. The analysis becomes:
+
+**transcript + event log + matched intent graph + sim pack truth + audio features**
+
+That is way stronger than transcript alone.
+
+#### The Product Moat
+
+Most emotion datasets know "angry/sad/happy." They do not know:
+
+> *"This first-line candidate lost control of the call when the user became impatient. They sounded calm but failed to clarify impact. The scenario script expected them to check Outbox first, but they jumped to reinstalling Outlook. That missed step 2 of 6 in the ideal path."*
+
+That is our domain-specific layer. **Scenario-aware behavioural analysis** — not emotion recognition.
+
+---
+
+### How the Two Engines Connect
+
+```
+Before the call:
+
+  Manager script + sim pack
+    → ConversationResponseGraph compiler
+      → likely candidate intent nodes
+      → customer response variants with mood
+      → state transitions
+      → rubric evidence tags
+      → preload audio manifest
+        → TTS batch-generates all cached audio
+
+During the call:
+
+  Candidate utterance
+    → intent classifier
+    → match graph node
+    → play cached audio (80%+) or template or LLM
+    → update scenario state
+    → log matched node + evidence to event log
+    → preload next likely responses
+
+After the call:
+
+  Event log + matched intent graph + transcript
+    → audio feature extraction
+    → scenario truth cross-reference
+    → rubric evidence matching
+    → LLM narrative synthesis
+    → manager review + calibration
+    → feedback → better sim packs
+```
+
+This architecture solves four problems at once:
+
+| Problem | Solution |
+|---------|----------|
+| Latency | Preloaded audio + state machine → instant responses for 80%+ of turns |
+| Realism | Manager-authored script + mood variants → believable, consistent persona |
+| Scoring | Every matched node becomes structured evidence with rubric tags |
+| Customisation | Same scenario, different graph density → beginner/intermediate/advanced |
+
+---
+
+### Framing Principle
+
+We do not claim to read "true emotional state." We produce *signals suggesting confidence, hesitation, pressure, interruption, calmness, pace, and customer-handling quality* — grounded in a known scenario with a known customer, against a known rubric. That is defensible and manager-useful.
 
 ---
 
@@ -638,147 +926,22 @@ The spec above is my best judgment. These are the areas where I am genuinely unc
 
 ---
 
-## Analysis Engine Architecture: Scenario-Aware Behavioural Analysis
+## Forward-Looking: Training Path & Multimodal Endgame
 
-*This section captures the strategic vision for the analysis engine. It supersedes the "emotion recognition" framing with a more defensible, sim-pack-aware approach.*
-
-### The Core Insight
-
-For analysis, we do not need real-time multimodal response. We need the most accurate possible post-call understanding of:
-
-```
-What happened in the call?
-What was the customer/caller supposed to be feeling?
-What hidden facts existed in the sim pack?
-What signals did the candidate notice or miss?
-What did they do technically?
-What did they do socially?
-How good was the final ticket note?
-```
-
-**A real call analysis tool only has:** audio + transcript.
-
-**CallCallum has:** audio, transcript, candidate events, ticket note, scenario hidden facts, customer persona, expected emotional trajectory, red flags, ideal path, manager rubric.
-
-This is the whole advantage of simulation. The analysis can ***cheat*** — and that is good.
-
-### Example: Scenario-Aware Analysis
-
-Given a sim pack that contains:
-
-```json
-{
-  "customer_state": {
-    "initial": "frustrated but not technical",
-    "hidden_need": "wants reassurance before troubleshooting",
-    "escalates_if": "candidate ignores business impact or sounds dismissive",
-    "calms_if": "candidate acknowledges frustration and gives clear next step"
-  }
-}
-```
-
-The analysis can say:
-
-> *"The customer was scripted to be frustrated and worried about missing a dental appointment email. The candidate focused on technical steps but did not acknowledge the business impact until minute 04:12. This delayed customer trust and caused the caller to become more impatient."*
-
-That is miles better than generic "tone was good."
-
-### Analysis Architecture: Offline Multi-Pass Judge
-
-Do not use one mega prompt. Use an offline multi-pass pipeline:
-
-```
-Pass 1: Transcript cleanup + turn reconstruction
-        → speaker labels, timing, word alignment
-
-Pass 2: Scenario storyline reconstruction
-        → what was the customer's hidden state at each turn?
-        → what was the candidate supposed to discover?
-
-Pass 3: Candidate action extraction
-        → from event log: tools opened, tickets created, triage performed
-
-Pass 4: Audio/prosody feature extraction
-        → openSMILE eGeMAPS per turn
-        → pause analysis, pitch variability, energy
-
-Pass 5: Rubric evidence matching
-        → which criteria were met? where is the transcript evidence?
-        → did the candidate miss critical hidden facts?
-
-Pass 6: Final manager-readable review
-        → LLM synthesis: features + evidence → narrative
-```
-
-### The Core Object
-
-```json
-{
-  "scenario_truth": {
-    "hidden_facts": [],
-    "customer_persona": {},
-    "expected_emotional_trajectory": [],
-    "red_flags": [],
-    "ideal_path": []
-  },
-  "customer_state_timeline": [
-    { "timestamp_ms": 0, "state": "frustrated", "hidden_need": "reassurance" },
-    { "timestamp_ms": 12000, "state": "impatient", "trigger": "impact_not_acknowledged" }
-  ],
-  "candidate_behaviour_timeline": [
-    { "timestamp_ms": 5000, "action": "asked_about_error", "technical": true, "social": false },
-    { "timestamp_ms": 25000, "action": "acknowledged_frustration", "technical": false, "social": true }
-  ],
-  "technical_decisions": [
-    { "action": "checked_webmail", "correct": true, "timestamp_ms": 15000 }
-  ],
-  "communication_decisions": [
-    { "action": "used_jargon", "correct": false, "timestamp_ms": 8000, "note": "said 'OST file' without explanation" }
-  ],
-  "audio_signals": [
-    { "timestamp_ms": 12000, "feature": "pause_before_answer_ms", "value": 2400, "interpretation": "hesitation before impact question" }
-  ],
-  "ticket_note_quality": {
-    "has_hostname": false,
-    "has_impact": true,
-    "has_next_step": true,
-    "missing_fields": ["hostname", "error_message"]
-  },
-  "rubric_evidence": [
-    { "criterion": "identity_check", "status": "verified", "evidence": "\"Can I get your name please?\"" }
-  ],
-  "final_scores": {}
-}
-```
-
-This is where the moat starts. Not "emotion recognition" — **scenario-aware behavioural analysis.**
+*Now that the core architecture is defined above, this section captures the long-term training trajectory. The live sim engine (Conversation Response Graph) and analysis engine (Six-Pass Judge) are the foundation. This is what you build on top of them.*
 
 ### Custom Multimodal Model Endgame
 
-Yes, a Qwen-Omni-style model is the long-term dream. Qwen2.5-Omni / Qwen3-Omni process text, images, audio, and video while generating text and natural speech in a streaming way. The Thinker-Talker architecture enables real-time voice/video chat.
+Qwen2.5-Omni / Qwen3-Omni can process text, images, audio, and video while generating text and natural speech in a streaming way (Thinker-Talker architecture). The endgame model could receive audio, transcript, sim pack, event log, and manager rubric, and directly output behavioural analysis, scoring evidence, coaching feedback, and next scenario recommendation.
 
-The endgame model could receive:
-
-- audio
-- transcript
-- sim pack
-- event log
-- manager rubric
-
-and directly output:
-
-- behavioural analysis
-- scoring evidence
-- coaching feedback
-- next scenario recommendation
-
-**But do not start by fine-tuning the full model.** Start by collecting structured data.
+**But do not start by fine-tuning the full model.** Start by collecting structured data from the Conversation Response Graph and Six-Pass Judge.
 
 ### What to Train First
 
 Train a small custom layer *before* fine-tuning a giant multimodal model:
 
 **Input:**
+- matched intent graph (which nodes were hit, missed, skipped)
 - transcript features (filler count, WPM, response latency)
 - audio/prosody features (pitch variability, jitter, eGeMAPS)
 - scenario metadata (hidden facts, customer persona, red flags)
@@ -796,101 +959,22 @@ Train a small custom layer *before* fine-tuning a giant multimodal model:
 
 This gives a CallCallum-specific evaluator that learns what "good first-line support" sounds like in an MSP call. Later, with enough data, fine-tune or adapt a multimodal model.
 
-### Live Call Architecture (for response latency)
-
-#### Practical Latency Target
-
-Under 2 seconds from user stops speaking → AI starts speaking feels alive. Cartesia/OpenAI can do ~200-500ms. For MVP, target 1.0–1.8s.
-
-#### Key Hacks
-
-**A. Use tiny customer responses.**
-
-Short text means faster LLM and faster TTS.
-
-> Bad: *"I can confirm that the emails appear to remain in the Outbox and are not being transmitted."*
->
-> Good: *"Yeah, it's stuck in Outbox."*
-
-**B. Pre-generate common utterances.**
-
-For a sim pack, many customer responses are predictable. Cache audio for:
-
-- "Hello?"
-- "Yeah."
-- "No, I haven't tried that."
-- "One sec."
-- "Okay, I see it."
-- "It says Work Offline."
-- "I'm not sure."
-- "That fixed it, thanks."
-
-If the LLM chooses one of those, playback is instant. This fakes Cartesia-like responsiveness for common turns.
-
-**C. Use response templates.**
-
-Instead of full LLM generation every turn:
-
-```
-intent detected → response candidate → optional LLM polish
-```
-
-Candidate asks if Work Offline is enabled. The sim engine already knows the hidden cause. Return cached/template response: *"Yeah, that button is highlighted."* No model required.
-
-**D. Generate while user is still speaking.**
-
-Streaming STT gives partials. If the user says *"Can you check if there's a button that says Work Offline..."*, the system can prepare a likely response before the user finishes.
-
-**E. Keep connections warm.**
-
-Persistent WebSocket connections for STT, LLM stream, TTS stream. Avoid cold HTTP calls per turn.
-
-**F. Barge-in matters more than raw latency.**
-
-If the candidate starts talking, stop the AI voice instantly. Even a 1.5s response feels conversational with barge-in.
-
-#### Best Live-Call Architecture
-
-Do not make the LLM do everything. Use a scenario state machine + short LLM responses:
-
-```
-Candidate utterance
-  → classify candidate intent/action
-  → update scenario state
-  → choose customer response type
-  → produce short response
-  → stream TTS
-```
-
-Example:
-
-```json
-{
-  "candidate_action": "asked_to_check_work_offline",
-  "scenario_state_update": "hidden_cause_discovered",
-  "customer_response_type": "confirms_observation",
-  "response_text": "Yeah, that button is highlighted."
-}
-```
-
-This is faster, more controllable, and easier to score.
-
-### Summary: Endgame vs Now
+### Endgame vs Now Summary
 
 | | Endgame | Now (MVP) |
 |---|---------|-----------|
-| **Customer model** | Custom multimodal LLM | Scenario state machine + short LLM responses |
-| **Analysis** | Multimodal model hears audio directly | Offline multi-pass: features + LLM interpretation |
-| **Response latency** | 200-500ms | 1.0-1.8s (template + cached + streaming) |
-| **Scoring** | Model-internal | Rubric evidence matching + structured output |
-| **Moat** | Custom CallCallum model + data | Sim-pack-aware analysis + manager feedback |
+| **Customer model** | Custom multimodal LLM | Conversation Response Graph + preloaded audio |
+| **Analysis** | Multimodal model hears audio directly | Six-Pass Judge: features + intent graph + LLM |
+| **Response latency** | 200-500ms | ~instant (cached) / ~800-2300ms (LLM fallback) |
+| **Scoring** | Model-internal | Matched graph nodes + rubric evidence |
+| **Moat** | Custom CallCallum model + data | Conversation Response Graph + manager feedback |
 
 ### Strongest Recommendation
 
-1. Make **analysis offline and accurate** — the six-pass judge extracting scenario-aware evidence.
-2. Make **live call fast and controlled** — state machine, short responses, cached audio, barge-in.
-3. Do not force the live customer model to be deeply intelligent. The intelligence lives in: sim pack, state machine, analysis engine, manager feedback.
-4. The live customer just needs to respond believably and quickly.
+1. Make **analysis offline and accurate** — the six-pass judge extracting scenario-aware evidence, leveraging the matched intent graph from the live sim.
+2. Make **live call fast and controlled** — Conversation Response Graph, preloaded audio, intent classification, barge-in.
+3. Do not force the live customer model to be deeply intelligent. The intelligence lives in: Conversation Response Graph, sim pack, analysis engine, manager feedback.
+4. The live customer just needs to match intents and play believable responses quickly.
 
 **The product moat is not beating Cartesia at TTS. The moat is scenario-aware analysis of MSP support behaviour + manager calibration + structured evidence + training recommendations.**
 
