@@ -894,4 +894,200 @@ This is faster, more controllable, and easier to score.
 
 **The product moat is not beating Cartesia at TTS. The moat is scenario-aware analysis of MSP support behaviour + manager calibration + structured evidence + training recommendations.**
 
+---
+
+## Latency Deep Dive: Getting Near-Cartesia Feel
+
+*This section expands on the live-call architecture above with concrete latency budgets, streaming strategies, and the simulation-specific advantages that let CallCallum compete with Cartesia's ~100ms TTS.*
+
+### What Cartesia-Level Latency Actually Means
+
+A normal voice app does this:
+
+```
+user stops speaking
+  → transcribe full audio
+  → LLM generates full response
+  → TTS generates full audio
+  → play audio
+```
+
+That is doomed.
+
+A low-latency system does this:
+
+```
+user starts speaking
+  → streaming ASR/VAD begins immediately
+  → partial transcript updates
+  → LLM starts once intent is clear
+  → first words stream out
+  → TTS starts on first phrase
+  → audio plays while rest is still generating
+```
+
+With streaming, latency becomes the *maximum* of the stages (because they overlap), not the sum. That is the core secret.
+
+### Two Levels of Attack
+
+| Level | Definition | CallCallum Can Win? |
+|-------|-----------|---------------------|
+| Perceived conversation latency | How fast it *feels* — includes anticipation, caching, barge-in, state machine | **Yes, probably** |
+| Raw TTS first-audio latency | Model-level time-to-first-token for arbitrary text | **No** — unless you build a custom streaming TTS model |
+
+### How to Beat Perceived Latency Without Beating Cartesia's TTS
+
+You do not need to beat Cartesia as a generic TTS company. You can beat their *felt response speed* inside the constrained MSP sim by cheating intelligently.
+
+#### 1. Pre-generate Common Audio
+
+In a support call, most customer replies are predictable:
+
+```
+"Hello?"
+"Yeah."
+"No, I haven't tried that."
+"One sec."
+"I don't know."
+"It says Work Offline."
+"Okay, that fixed it."
+"Can you please hurry? I've got a meeting."
+```
+
+For each sim pack, pre-generate 50–200 common utterances. During the call, the scenario engine picks the matching cached response and plays it instantly. This can *feel* faster than Cartesia because you are not synthesising at all for common turns.
+
+#### 2. Scenario State Machine Before the LLM
+
+Do not ask the LLM to invent every response. Use:
+
+```
+candidate utterance
+  → classify intent/action
+  → update scenario state
+  → choose response type
+  → cached/template response OR short LLM response
+```
+
+```json
+{
+  "candidate_action": "asked_to_check_outbox",
+  "scenario_state": "candidate_investigating_email_flow",
+  "customer_response": "Yeah, there are three emails stuck there."
+}
+```
+
+That response can be cached. **This is the biggest CallCallum-specific advantage.** Cartesia has to handle any text. You only need believable MSP customer turns.
+
+#### 3. Start Thinking Before the User Finishes
+
+Use streaming STT partials. If the candidate says *"Can you check if there's a button that says Work Offline..."*, the scenario engine can already prepare *"Yeah, that button is highlighted."* This is how human conversation feels responsive: people anticipate.
+
+#### 4. Keep All Sockets Warm
+
+Persistent connections: browser ↔ backend WebSocket, backend ↔ STT streaming, backend ↔ LLM streaming, backend ↔ TTS streaming. Avoid cold HTTP calls per turn.
+
+#### 5. Stream Tiny Chunks to TTS
+
+Do not wait for a full sentence. Send `"Yeah,"` then `"it's stuck"` then `"in Outbox."`
+
+**Caveat:** Streaming TTS has accuracy tradeoffs — less future context means names, IDs, and numbers can be mispronounced. For CallCallum this is fine because customer replies are short and simple.
+
+### If You Really Want to Build Low-Latency TTS
+
+The research direction is:
+
+```
+text tokens / phonemes arrive
+  → model predicts speech/audio tokens incrementally
+  → vocoder/audio decoder streams chunks immediately
+```
+
+| System | Claimed Latency | Notes |
+|--------|----------------|-------|
+| VoXtream | First-word start | Fully autoregressive streaming TTS |
+| FlashTTS | ~325ms first-packet | Open-source, avoids sentence-level buffering |
+| SyncSpeech | Dual-stream | Begins after second text token |
+| CosyVoice2-0.5B | ~150ms streaming | Lightweight, needs GPU |
+
+Technically possible, but you would be building a TTS infra/model project, not an MSP sim product.
+
+### Realistic Routes
+
+**Route A — Product-Hack (Recommended):** Normal streaming TTS provider, beat latency through cached utterances, state machine, partial STT, short replies, barge-in, warm sockets, audio queue. Target: cached 50–150ms, generated 800–1800ms.
+
+**Route B — Open-Source Streaming TTS (Experimental):** CosyVoice2-0.5B, Fish Speech, IndexTTS, FlashTTS. Needs GPU hosting.
+
+**Route C — Build Your Own Cartesia (Do Not Do This):** Streaming TTS model, audio tokeniser, neural codec, low-latency decoder, GPU inference, WebSocket infra, chunk scheduler, voice cloning, autoscaling. This is a company by itself.
+
+### Concrete Build Plan
+
+```
+Browser:
+  - VAD detects user speech start/end
+  - barge-in cancels AI audio instantly
+  - audio playback queue
+
+Backend realtime session:
+  - receives audio chunks
+  - maintains scenario state
+  - receives partial transcript
+  - classifies candidate action early
+  - selects cached/template/LLM response
+  - streams text to TTS
+  - streams audio back
+
+Scenario audio cache:
+  - common utterance library per persona
+  - common utterance library per sim pack
+  - emotional variants: neutral / impatient / relieved
+```
+
+#### Latency Budget
+
+| Stage | Cached Reply | Generated Reply |
+|-------|-------------|-----------------|
+| VAD end-of-speech | 300–600ms | 300–600ms |
+| Candidate action classification | 50–200ms | — |
+| STT final/partial | — | 100–500ms |
+| LLM first phrase | — | 200–700ms |
+| Cached response lookup | ~0ms | — |
+| TTS first audio | — | 100–400ms |
+| Audio playback buffer | 50–100ms | 50–100ms |
+| **Total after user stops** | **~400–900ms** | **~800–2300ms** |
+
+### The Trick That Could Make CallCallum Feel Faster Than Cartesia
+
+**Predictive response priming.** For every scenario state, prepare likely next responses:
+
+```
+state: user troubleshooting Outlook
+  likely candidate asks:
+    - "Are emails stuck in Outbox?"
+    - "Is internet working?"
+    - "Can you see Work Offline?"
+  pre-warm/cache:
+    - "Yeah, there are three stuck there."
+    - "The internet seems fine."
+    - "Yeah, Work Offline is highlighted."
+```
+
+The moment the candidate asks one of these, play the response instantly. That is not generic TTS. That is simulation-specific latency advantage.
+
+### What Not to Do
+
+Do not spend months trying to beat Cartesia with a custom TTS model. Instead:
+1. Cache predictable customer responses.
+2. Use streaming TTS only for unpredictable text.
+3. Make customer replies short.
+4. Add barge-in.
+5. Use persistent sockets.
+6. Add latency instrumentation.
+7. Optimise the worst stage based on real logs.
+
+### Blunt Take
+
+Cartesia's raw value is low-latency streaming speech. You probably will not beat that generally. **But CallCallum can feel just as fast, maybe faster**, because your world is constrained: finite scenario, finite customer persona, finite hidden facts, finite likely questions, short realistic replies. That lets you cheat with cached speech and state-machine responses. That is the path.
+
+---
+
 Cartesia gives voices. CallCallum gives judgement.
