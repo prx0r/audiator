@@ -387,6 +387,77 @@ This is where slower agentic reasoning is valuable. Not in the live sim loop.
 
 ---
 
+## LiveKit: What It Actually Is
+
+LiveKit is a **WebRTC media router / SFU** — it moves audio around. It does not do AI. It does not need a GPU. It is written in Go and runs on any CPU VPS.
+
+### Does It Need a GPU?
+
+| Component | GPU Required? |
+|---|---|
+| LiveKit server (SFU) | **No** — Go binary, pure CPU |
+| Pipecat voice worker | No, unless your STT/TTS models need it |
+| Kokoro TTS | No — runs on CPU via ONNX |
+| Whisper/local STT | CPU possible (slower), GPU helps |
+| LLM | API-based (no GPU) or local (GPU if self-hosted) |
+
+LiveKit itself is not the expensive bit.
+
+### Is It Free?
+
+| Scenario | Cost |
+|---|---|
+| Self-hosted (local dev / your Hetzner) | Software is free. Pay only for the machine. |
+| Self-hosted (production) | Server cost + your ops burden |
+| LiveKit Cloud | Metered: WebRTC minutes, agent sessions, STT/TTS/LLM per-minute |
+
+Self-hosting on your Hetzner 2-core box: LiveKit server uses minimal CPU/RAM. It will run fine alongside Next.js and Kokoro for a prototype.
+
+### Is It Easy to Add?
+
+For a basic audio room: yes (~30 mins to get a room running). For a full voice agent pipeline with graph prediction, cached audio, and scoring: medium complexity.
+
+The minimum viable integration:
+
+```
+1. CX-Train creates assessment attempt
+2. Backend creates LiveKit room + access token
+3. Candidate browser joins room
+4. Voice worker joins same room as "customer"
+5. Candidate speaks
+6. Worker receives audio
+7. Worker runs STT → ScenarioGraph → TTS/cache
+8. Worker publishes customer audio back into room
+9. Worker sends route events to CX-Train
+```
+
+The hard part is not LiveKit. The hard part is **the worker** — the ScenarioGraph runtime, intent matcher, preload manager, and fallback policy.
+
+### Should You Add It Now?
+
+**Not yet for CX-Train mainline.** Add it in Audiator first.
+
+Your current priority is proving:
+
+```
+partial transcript → graph prediction → preload cached Kokoro audio → instant response
+```
+
+You can test that without LiveKit using the existing browser/audio loop. Once that works, LiveKit becomes worth adding because it gives you:
+
+- Real WebRTC call feel
+- Barge-in / interruptions
+- Clean room-per-attempt architecture
+- Better audio transport (no HTTP-blob-upload dance)
+- Future SIP/phone-call direction
+- Agent joins as a participant, not a hidden process
+
+### Blunt Conclusion
+
+LiveKit is not a GPU problem and not the expensive AI part. It is a **transport upgrade**. Use it when you want the sim to feel like a real call. But the thing that makes CallCallum smart is still the ScenarioGraph + intent matching + preloaded responses + route-as-evidence scoring. Build that first.
+
+---
+
 ## First Experiment
 
 Build this in audiator (the standalone lab, not CX-Train):
