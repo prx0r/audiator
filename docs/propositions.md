@@ -635,3 +635,263 @@ The spec above is my best judgment. These are the areas where I am genuinely unc
 | pyannote vs sherpa-onnx | 20 mixed recordings, diarization accuracy | When unknown recordings are needed |
 | eGeMAPS vs ComParE | Compare classifier accuracy after Phase 4 training | During Phase 4 |
 | LLM provider | 50 comparisons, narrative quality | Before production deployment |
+
+---
+
+## Analysis Engine Architecture: Scenario-Aware Behavioural Analysis
+
+*This section captures the strategic vision for the analysis engine. It supersedes the "emotion recognition" framing with a more defensible, sim-pack-aware approach.*
+
+### The Core Insight
+
+For analysis, we do not need real-time multimodal response. We need the most accurate possible post-call understanding of:
+
+```
+What happened in the call?
+What was the customer/caller supposed to be feeling?
+What hidden facts existed in the sim pack?
+What signals did the candidate notice or miss?
+What did they do technically?
+What did they do socially?
+How good was the final ticket note?
+```
+
+**A real call analysis tool only has:** audio + transcript.
+
+**CallCallum has:** audio, transcript, candidate events, ticket note, scenario hidden facts, customer persona, expected emotional trajectory, red flags, ideal path, manager rubric.
+
+This is the whole advantage of simulation. The analysis can ***cheat*** — and that is good.
+
+### Example: Scenario-Aware Analysis
+
+Given a sim pack that contains:
+
+```json
+{
+  "customer_state": {
+    "initial": "frustrated but not technical",
+    "hidden_need": "wants reassurance before troubleshooting",
+    "escalates_if": "candidate ignores business impact or sounds dismissive",
+    "calms_if": "candidate acknowledges frustration and gives clear next step"
+  }
+}
+```
+
+The analysis can say:
+
+> *"The customer was scripted to be frustrated and worried about missing a dental appointment email. The candidate focused on technical steps but did not acknowledge the business impact until minute 04:12. This delayed customer trust and caused the caller to become more impatient."*
+
+That is miles better than generic "tone was good."
+
+### Analysis Architecture: Offline Multi-Pass Judge
+
+Do not use one mega prompt. Use an offline multi-pass pipeline:
+
+```
+Pass 1: Transcript cleanup + turn reconstruction
+        → speaker labels, timing, word alignment
+
+Pass 2: Scenario storyline reconstruction
+        → what was the customer's hidden state at each turn?
+        → what was the candidate supposed to discover?
+
+Pass 3: Candidate action extraction
+        → from event log: tools opened, tickets created, triage performed
+
+Pass 4: Audio/prosody feature extraction
+        → openSMILE eGeMAPS per turn
+        → pause analysis, pitch variability, energy
+
+Pass 5: Rubric evidence matching
+        → which criteria were met? where is the transcript evidence?
+        → did the candidate miss critical hidden facts?
+
+Pass 6: Final manager-readable review
+        → LLM synthesis: features + evidence → narrative
+```
+
+### The Core Object
+
+```json
+{
+  "scenario_truth": {
+    "hidden_facts": [],
+    "customer_persona": {},
+    "expected_emotional_trajectory": [],
+    "red_flags": [],
+    "ideal_path": []
+  },
+  "customer_state_timeline": [
+    { "timestamp_ms": 0, "state": "frustrated", "hidden_need": "reassurance" },
+    { "timestamp_ms": 12000, "state": "impatient", "trigger": "impact_not_acknowledged" }
+  ],
+  "candidate_behaviour_timeline": [
+    { "timestamp_ms": 5000, "action": "asked_about_error", "technical": true, "social": false },
+    { "timestamp_ms": 25000, "action": "acknowledged_frustration", "technical": false, "social": true }
+  ],
+  "technical_decisions": [
+    { "action": "checked_webmail", "correct": true, "timestamp_ms": 15000 }
+  ],
+  "communication_decisions": [
+    { "action": "used_jargon", "correct": false, "timestamp_ms": 8000, "note": "said 'OST file' without explanation" }
+  ],
+  "audio_signals": [
+    { "timestamp_ms": 12000, "feature": "pause_before_answer_ms", "value": 2400, "interpretation": "hesitation before impact question" }
+  ],
+  "ticket_note_quality": {
+    "has_hostname": false,
+    "has_impact": true,
+    "has_next_step": true,
+    "missing_fields": ["hostname", "error_message"]
+  },
+  "rubric_evidence": [
+    { "criterion": "identity_check", "status": "verified", "evidence": "\"Can I get your name please?\"" }
+  ],
+  "final_scores": {}
+}
+```
+
+This is where the moat starts. Not "emotion recognition" — **scenario-aware behavioural analysis.**
+
+### Custom Multimodal Model Endgame
+
+Yes, a Qwen-Omni-style model is the long-term dream. Qwen2.5-Omni / Qwen3-Omni process text, images, audio, and video while generating text and natural speech in a streaming way. The Thinker-Talker architecture enables real-time voice/video chat.
+
+The endgame model could receive:
+
+- audio
+- transcript
+- sim pack
+- event log
+- manager rubric
+
+and directly output:
+
+- behavioural analysis
+- scoring evidence
+- coaching feedback
+- next scenario recommendation
+
+**But do not start by fine-tuning the full model.** Start by collecting structured data.
+
+### What to Train First
+
+Train a small custom layer *before* fine-tuning a giant multimodal model:
+
+**Input:**
+- transcript features (filler count, WPM, response latency)
+- audio/prosody features (pitch variability, jitter, eGeMAPS)
+- scenario metadata (hidden facts, customer persona, red flags)
+- expected customer-state timeline
+- candidate action log
+
+**Label:**
+- manager score
+- manager correction
+- "good evidence / bad evidence"
+- readiness decision
+- weak area tags
+
+**Model:** small classifier/regressor, or embedding retrieval model, or preference/ranking model (XGBoost, logistic regression, small MLP).
+
+This gives a CallCallum-specific evaluator that learns what "good first-line support" sounds like in an MSP call. Later, with enough data, fine-tune or adapt a multimodal model.
+
+### Live Call Architecture (for response latency)
+
+#### Practical Latency Target
+
+Under 2 seconds from user stops speaking → AI starts speaking feels alive. Cartesia/OpenAI can do ~200-500ms. For MVP, target 1.0–1.8s.
+
+#### Key Hacks
+
+**A. Use tiny customer responses.**
+
+Short text means faster LLM and faster TTS.
+
+> Bad: *"I can confirm that the emails appear to remain in the Outbox and are not being transmitted."*
+>
+> Good: *"Yeah, it's stuck in Outbox."*
+
+**B. Pre-generate common utterances.**
+
+For a sim pack, many customer responses are predictable. Cache audio for:
+
+- "Hello?"
+- "Yeah."
+- "No, I haven't tried that."
+- "One sec."
+- "Okay, I see it."
+- "It says Work Offline."
+- "I'm not sure."
+- "That fixed it, thanks."
+
+If the LLM chooses one of those, playback is instant. This fakes Cartesia-like responsiveness for common turns.
+
+**C. Use response templates.**
+
+Instead of full LLM generation every turn:
+
+```
+intent detected → response candidate → optional LLM polish
+```
+
+Candidate asks if Work Offline is enabled. The sim engine already knows the hidden cause. Return cached/template response: *"Yeah, that button is highlighted."* No model required.
+
+**D. Generate while user is still speaking.**
+
+Streaming STT gives partials. If the user says *"Can you check if there's a button that says Work Offline..."*, the system can prepare a likely response before the user finishes.
+
+**E. Keep connections warm.**
+
+Persistent WebSocket connections for STT, LLM stream, TTS stream. Avoid cold HTTP calls per turn.
+
+**F. Barge-in matters more than raw latency.**
+
+If the candidate starts talking, stop the AI voice instantly. Even a 1.5s response feels conversational with barge-in.
+
+#### Best Live-Call Architecture
+
+Do not make the LLM do everything. Use a scenario state machine + short LLM responses:
+
+```
+Candidate utterance
+  → classify candidate intent/action
+  → update scenario state
+  → choose customer response type
+  → produce short response
+  → stream TTS
+```
+
+Example:
+
+```json
+{
+  "candidate_action": "asked_to_check_work_offline",
+  "scenario_state_update": "hidden_cause_discovered",
+  "customer_response_type": "confirms_observation",
+  "response_text": "Yeah, that button is highlighted."
+}
+```
+
+This is faster, more controllable, and easier to score.
+
+### Summary: Endgame vs Now
+
+| | Endgame | Now (MVP) |
+|---|---------|-----------|
+| **Customer model** | Custom multimodal LLM | Scenario state machine + short LLM responses |
+| **Analysis** | Multimodal model hears audio directly | Offline multi-pass: features + LLM interpretation |
+| **Response latency** | 200-500ms | 1.0-1.8s (template + cached + streaming) |
+| **Scoring** | Model-internal | Rubric evidence matching + structured output |
+| **Moat** | Custom CallCallum model + data | Sim-pack-aware analysis + manager feedback |
+
+### Strongest Recommendation
+
+1. Make **analysis offline and accurate** — the six-pass judge extracting scenario-aware evidence.
+2. Make **live call fast and controlled** — state machine, short responses, cached audio, barge-in.
+3. Do not force the live customer model to be deeply intelligent. The intelligence lives in: sim pack, state machine, analysis engine, manager feedback.
+4. The live customer just needs to respond believably and quickly.
+
+**The product moat is not beating Cartesia at TTS. The moat is scenario-aware analysis of MSP support behaviour + manager calibration + structured evidence + training recommendations.**
+
+Cartesia gives voices. CallCallum gives judgement.
