@@ -19,64 +19,137 @@ The critical insight: **these are not separate.** The live sim engine produces s
 
 ---
 
-### Live Sim Engine: Conversation Response Graph
+### Live Sim Engine: VoiceAgentRAG-Style Predictive Graph
 
-*This is the single most important architectural decision. Stop trying to make the LLM generate every response in real time.*
+*Clone the VoiceAgentRAG architecture, but make the cached object "customer responses + graph transitions + evidence tags." Dual-agent pattern: a background Slow Thinker predicts likely next candidate actions and preloads responses, while a foreground Fast Talker reads from that cache for instant replies.*
 
 #### The Core Idea
 
-The manager/Callum creates a sim pack with a scenario, hidden cause, and expected candidate path. That script is compiled into a **Conversation Response Graph** — a directed tree of likely candidate intents, preloaded customer responses, state transitions, and rubric evidence tags.
+The manager/Callum creates a sim pack with a scenario, hidden cause, and expected candidate path. That script is compiled into a **Scenario Graph** — a directed graph where each node represents a **candidate action**, not a line of dialogue. Each node contains response variants, state transitions, evidence tags, and score impacts.
 
-Before the call even starts, the likely customer responses are pre-generated as audio files. The system does not need to synthesise anything for 80%+ of turns.
+A background **Slow Thinker** predicts likely next candidate actions and preloads customer response audio. A foreground **Fast Talker** matches the candidate's utterance to a graph node and plays the preloaded response instantly.
 
-#### The Compiled Artefact
+#### VoiceAgentRAG Translation
 
 ```
-SimPackDraft
-  → RuntimeSimPack
-    → ConversationResponseGraph
-      → PreloadedAudioManifest
+VoiceAgentRAG:
+  conversation → predict likely next RAG chunks → cache → fast answer
+
+CallCallum:
+  scenario state → predict likely candidate actions → preload customer response/audio → fast caller reply
 ```
 
-#### Conversation Response Graph Node
+#### The Graph Is Not LangGraph
+
+Use a **custom finite-state scenario graph** for the live call. LangGraph is for agent orchestration, durable execution, streaming, and human-in-the-loop flows — ideal for Callum (the assistant) and offline analysis, not the millisecond-sensitive live response loop.
+
+```
+Live call graph = custom TypeScript runtime
+Callum workflow graph = LangGraph
+Analysis pipeline = LangGraph
+Sim-pack compiler = LangGraph
+```
+
+The live call runtime should be: Rasa-style dialogue state + VoiceAgentRAG-style predictive cache + CallCallum scoring events. A plain TypeScript engine.
+
+#### Graph Node Structure
+
+Each node represents a **candidate action**:
 
 ```json
 {
-  "node_id": "outlook_outbox_check",
-  "candidate_intents": [
-    "asks_about_outbox",
-    "asks_if_emails_are_stuck",
-    "asks_where_unsent_emails_are"
+  "id": "outlook_check_work_offline",
+  "stage": "diagnosis",
+  "candidateIntent": "ask_work_offline_status",
+  "examplePhrases": [
+    "Can you check if Work Offline is turned on?",
+    "Is the Work Offline button highlighted?",
+    "Can you go to Send/Receive and check Work Offline?"
   ],
-  "example_candidate_phrases": [
-    "Are the emails stuck in your Outbox?",
-    "Can you check your Outbox?",
-    "Where are the emails sitting?"
-  ],
-  "customer_responses": [
+  "keywords": ["work offline", "offline mode", "send/receive"],
+  "preconditions": { "identityVerified": true },
+  "responseVariants": [
     {
+      "key": "work_offline_highlighted_neutral",
+      "text": "Yeah, the Work Offline button is highlighted.",
       "mood": "neutral",
-      "text": "Yeah, there are three emails sitting in Outbox.",
-      "audio_cache_key": "outlook_outbox_neutral_v1"
+      "priority": "high"
     },
     {
+      "key": "work_offline_highlighted_frustrated",
+      "text": "Yeah, it is highlighted. Is that why this isn't working?",
       "mood": "frustrated",
-      "text": "Yeah, there are three stuck there. I really need these sent.",
-      "audio_cache_key": "outlook_outbox_frustrated_v1"
+      "priority": "high"
     }
   ],
-  "state_update": { "outbox_checked": true },
-  "rubric_evidence": {
-    "positive": ["checked_outbox"],
-    "skill": "basic_email_troubleshooting"
-  },
-  "next_likely_nodes": [
-    "check_internet",
-    "check_work_offline",
-    "send_test_email"
+  "stateUpdate": { "workOfflineFound": true },
+  "evidenceTags": ["identified_work_offline"],
+  "scoreImpact": { "technicalTroubleshooting": 2, "diagnosticOrder": 1 },
+  "nextLikelyNodes": [
+    "outlook_disable_work_offline",
+    "outlook_send_test_email",
+    "explain_issue_to_customer"
+  ],
+  "badIfBefore": ["escalate_without_basic_checks", "reinstall_outlook"],
+  "qualityRules": [
+    { "condition": "rushed_to_fix_without_confirming", "tag": "fix_without_verification" }
   ]
 }
 ```
+
+#### Response Categories Taxonomy
+
+A controlled taxonomy of candidate intents:
+
+```
+opening
+identity_verification
+rapport_small_talk
+impact_scope
+symptom_clarification
+basic_check
+diagnostic_action
+resolution_action
+customer_reassurance
+expectation_setting
+escalation
+closure
+handover
+off_path
+unsafe_or_bad_action
+```
+
+For small talk:
+
+```json
+{
+  "id": "small_talk_weather",
+  "stage": "opening",
+  "candidateIntent": "rapport_small_talk",
+  "examplePhrases": [
+    "How's your day going?",
+    "Busy morning?",
+    "Hope you're doing alright apart from this."
+  ],
+  "responseVariants": [
+    {
+      "key": "small_talk_busy_day",
+      "text": "Yeah, it's been a bit manic honestly. I just need these emails sent.",
+      "mood": "frustrated",
+      "priority": "medium"
+    }
+  ],
+  "stateUpdate": { "rapportAttempted": true },
+  "evidenceTags": ["attempted_rapport"],
+  "qualityRules": [
+    { "condition": "small_talk_too_long", "tag": "rapport_became_time_wasting" },
+    { "condition": "small_talk_then_returns_to_issue", "tag": "good_light_rapport" }
+  ],
+  "nextLikelyNodes": ["ask_problem_summary", "ask_impact_scope"]
+}
+```
+
+The engine can distinguish good small talk (brief rapport, then back to issue) from bad small talk (avoids troubleshooting, wastes time).
 
 #### Preloaded Audio Manifest
 
@@ -103,35 +176,96 @@ SimPackDraft
 
 Before the call, generate and cache all high-priority audio. During the call, playback is instant for matched nodes.
 
-#### Runtime Loop
+#### Dual-Agent Architecture
+
+**1. Slow Thinker / Predictor** — runs in the background after every turn.
+
+Input: current graph node, scenario state, candidate progress, customer mood, expected path, historical behaviour.
+
+Output:
+```json
+{
+  "nextLikely": [
+    { "nodeId": "outlook_check_outbox", "probability": 0.42 },
+    { "nodeId": "outlook_check_internet", "probability": 0.26 },
+    { "nodeId": "outlook_check_work_offline", "probability": 0.21 },
+    { "nodeId": "bad_reinstall_outlook", "probability": 0.08 },
+    { "nodeId": "small_talk_busy_day", "probability": 0.03 }
+  ],
+  "preloadAudioKeys": [
+    "outbox_three_emails_frustrated_v1",
+    "internet_is_working_neutral_v1",
+    "work_offline_highlighted_frustrated_v1",
+    "reinstall_anxiety_response_v1"
+  ]
+}
+```
+
+**2. Fast Talker / Runtime** — runs during the live call.
 
 ```
-candidate utterance
-  → classify intent (keyword match → embedding similarity → small LLM)
-  → find matching graph node
-  → if confidence high: play preloaded response, update state, log evidence
-  → if confidence medium: template response from node + state
-  → if confidence low: LLM fallback (rare)
-  → preload next_likely_nodes from current node
+candidate text or partial transcript
+  → fast intent match (4-layer)
+  → cache lookup
+  → return preloaded audio/text
+  → log route
+  → if no high-confidence match: template response
+  → if still no match: LLM fallback
 ```
+
+#### 4-Layer Intent Matcher
+
+| Layer | Method | Speed | Coverage |
+|-------|--------|-------|----------|
+| 1 | Exact/keyword rules | ~0ms | ~40% |
+| 2 | Embedding similarity (sentence-transformers) | ~5-15ms | ~35% |
+| 3 | Tiny classifier / small model | ~10-30ms | ~15% |
+| 4 | LLM fallback | ~200-500ms | ~10% |
+
+Example:
+- Candidate: *"Is anything stuck in the outbox?"* → Layer 1 detects "outbox" → match `ask_outbox_status` → instant
+- Candidate: *"Can you see whether the message is still waiting somewhere rather than actually sent?"* → Layer 2 embedding catches
+- Candidate: *"Let's nuke Outlook and reinstall it."* → Layer 1/2 maps to `bad_reinstall_outlook` → customer responds *"Is that going to take ages?"* → evidence: `jumped_to_heavy_fix`
+
+#### Partial Transcript Matching
+
+For speed, start matching before the utterance fully ends. Candidate starts *"Can you check if Work Offline..."* — the fast runtime can already predict the node and preload `work_offline_highlighted_frustrated_v1`. When VAD confirms end-of-speech, play immediately.
 
 #### Three Response Layers
 
 | Layer | Trigger | Latency | % of Turns |
 |-------|---------|---------|------------|
-| **Preloaded exact** | Candidate matches expected intent | ~instant | ~60% |
-| **Template-generated** | Candidate is close but not exact | ~100-300ms | ~25% |
-| **LLM fallback** | Candidate goes off-script | ~800-2000ms | ~15% |
+| **Preloaded audio** | High-confidence graph match | ~instant | ~55% |
+| **Cached text + instant TTS** | Medium-confidence match | ~100-300ms | ~25% |
+| **LLM fallback** | No graph match | ~800-2000ms | ~20% |
 
-Goal: 80%+ preloaded or template, less than 20% LLM fallback.
+Goal: 80% preloaded or template, 20% LLM fallback.
 
-#### Intent Classification Strategy (Hybrid)
+Over time, the cache grows and the LLM fallback rate shrinks.
 
-For MVP, a hybrid classifier:
+#### Ultra-Low Latency Strategy
 
-1. **Keyword/rule match** for obvious patterns (fast, zero model)
-2. **Embedding similarity** against expected candidate phrases (lightweight)
-3. **Small LLM fallback** if uncertain (<20% of turns)
+Live customer responses should be vague but believable — specificity is recovered in post-analysis:
+
+- *"Yeah, I can see that."*
+- *"I'm not sure, where would I find that?"*
+- *"It says something about being offline."*
+
+You do not need a fully personalised answer every turn. Sacrifice specificity in the live response, recover it in post-analysis.
+
+#### How This Beats Generic Voice Latency
+
+Cartesia has to handle arbitrary text. Audiator handles only MSP customer turns in a known scenario. That constraint lets us pre-generate, cache, and play instantly.
+
+```
+candidate utterance
+  → match against likely intent (4-layer matcher)
+  → play preloaded response (0ms synthesis)
+  → update sim state
+  → Slow Thinker preloads next likely responses
+```
+
+The system *feels* like it is thinking and speaking instantly, but really it's a compiled state machine with a predictive cache.
 
 #### How This Creates Difficulty
 
@@ -143,16 +277,48 @@ Same scenario, different graph density:
 | Intermediate | Vague: "Something's highlighted at the top, not sure what" | Medium — must probe |
 | Advanced | Frustrated: "I don't know where that is, can you be specific?" | High — must manage tone + technique |
 
-#### How This Beats Generic Voice Latency
+#### The Route Log: Analysis Substrate
 
-Cartesia has to handle arbitrary text. Audiator handles only MSP customer turns in a known scenario. That constraint lets us pre-generate, cache, and play instantly. The system *feels* like it is thinking and speaking instantly, but really:
+Every candidate turn produces a route event:
 
+```json
+{
+  "turnId": "turn_004",
+  "candidateText": "Are the emails stuck in your Outbox?",
+  "matchedIntent": "ask_outbox_status",
+  "matchedNodeId": "outlook_check_outbox",
+  "matchConfidence": 0.92,
+  "customerResponseKey": "outbox_three_emails_frustrated_v1",
+  "responseSource": "preloaded_audio",
+  "stateBefore": {
+    "identityVerified": true,
+    "outboxChecked": false,
+    "workOfflineFound": false
+  },
+  "stateAfter": {
+    "identityVerified": true,
+    "outboxChecked": true,
+    "workOfflineFound": false
+  },
+  "evidenceTags": ["checked_outbox", "followed_basic_email_troubleshooting"],
+  "quality": {
+    "helpfulness": "good",
+    "reducedCustomerStress": true,
+    "movedTowardResolution": true
+  },
+  "betterAlternativeActions": ["ask_when_issue_started", "ask_if_internet_works"]
+}
 ```
-candidate utterance
-  → match against likely intent
-  → play preloaded response (0ms synthesis)
-  → update sim state (no LLM call for ~80% of turns)
-```
+
+The route through the graph becomes the real transcript of competence — not just what words were said, but:
+- matched intent/action
+- graph node reached
+- customer response chosen
+- scenario state changed
+- evidence tag logged
+- ideal/alternative path comparison
+
+That is much more useful than a flat transcript.
 
 ---
 
@@ -270,28 +436,43 @@ That is our domain-specific layer. **Scenario-aware behavioural analysis** — n
 Before the call:
 
   Manager script + sim pack
-    → ConversationResponseGraph compiler
-      → likely candidate intent nodes
+    → Scenario Graph compiler (custom TypeScript, not LangGraph)
+      → likely candidate action nodes
       → customer response variants with mood
       → state transitions
       → rubric evidence tags
+      → quality rules
+      → Slow Thinker pre-generates next-likely predictions
       → preload audio manifest
-        → TTS batch-generates all cached audio
+        → TTS batch-generates all cached audio (Kokoro self-hosted)
 
 During the call:
 
-  Candidate utterance
-    → intent classifier
+  Slow Thinker (background, after every turn):
+    → current node + state + candidate progress → predict next likely intents
+    → preload response audio for top 3-5 next nodes
+
+  Fast Talker (per utterance):
+    → candidate text or partial transcript
+    → 4-layer intent matcher (keyword → embedding → tiny model → LLM)
     → match graph node
     → play cached audio (80%+) or template or LLM
     → update scenario state
-    → log matched node + evidence to event log
-    → preload next likely responses
+    → log route event (matched node, evidence tags, state changes, quality)
+    → trigger Slow Thinker for next predictions
 
 After the call:
 
-  Event log + matched intent graph + transcript
-    → audio feature extraction
+  Route log (not just transcript) → analysis substrate
+    → ideal path vs actual path comparison
+    → missed required nodes
+    → bad branches taken
+    → time/turns to resolution
+    → customer mood trajectory
+    → helpfulness per turn
+    → fastest successful alternative route
+
+  Audio feature extraction
     → scenario truth cross-reference
     → rubric evidence matching
     → LLM narrative synthesis
@@ -303,12 +484,76 @@ This architecture solves four problems at once:
 
 | Problem | Solution |
 |---------|----------|
-| Latency | Preloaded audio + state machine → instant responses for 80%+ of turns |
-| Realism | Manager-authored script + mood variants → believable, consistent persona |
-| Scoring | Every matched node becomes structured evidence with rubric tags |
+| Latency | VoiceAgentRAG-style dual-agent: Slow Thinker preloads, Fast Talker plays instantly |
+| Realism | Manager-authored script + mood variants + quality rules → believable, consistent persona |
+| Scoring | Route log captures every matched node, evidence tag, and quality assessment |
 | Customisation | Same scenario, different graph density → beginner/intermediate/advanced |
 
 ---
+
+### Build Plan
+
+#### Phase 1 — One Hardcoded Graph
+
+Use the Outlook Work Offline scenario. Create:
+
+```
+lib/mvp/sim-graph/types.ts
+lib/mvp/sim-graph/outlook-work-offline.graph.ts
+lib/mvp/sim-graph/match-intent.ts
+lib/mvp/sim-graph/runtime.ts
+lib/mvp/sim-graph/route-log.ts
+```
+
+Graph nodes (keep tiny — 12-15 nodes):
+```
+opening
+identity_verification
+ask_problem_summary
+ask_error_message
+ask_outbox_status
+ask_internet_status
+ask_work_offline_status
+disable_work_offline
+send_test_email
+confirm_resolution
+write_note
+small_talk
+bad_reinstall_outlook
+bad_escalate_too_early
+bad_close_without_confirming
+```
+
+#### Phase 2 — Response Cache
+
+Add:
+```
+lib/mvp/sim-graph/response-cache.ts
+```
+
+Cache object with audio key, text, audio URL, generated timestamp. If audio missing, return text and generate TTS normally.
+
+#### Phase 3 — Slow Thinker Predictor
+
+Add:
+```
+lib/mvp/sim-graph/predict-next.ts
+```
+
+After each matched node, look at `nextLikelyNodes` and preload their high-priority response variants.
+
+#### Phase 4 — Route-Based Analysis
+
+Add:
+```
+lib/mvp/analysis/route-analysis.ts
+```
+
+Compute: ideal path completion, time/turns to resolution, bad branch count, missed required nodes, customer mood trajectory, helpfulness per turn, fastest successful alternative route.
+
+#### Phase 5 — Integration
+
+Add behind a flag: `USE_SCENARIO_GRAPH_RUNTIME=true`. If graph runtime fails, fallback to current LLM customer.
 
 ### Framing Principle
 
