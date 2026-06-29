@@ -245,6 +245,148 @@ lib/mvp/analysis/
 
 ---
 
+## Tech Split: What Owns What
+
+Do not use LangGraph in the live call loop. Use this division:
+
+| Layer | Technology | Owns |
+|---|---|---|
+| Product & scoring | CX-Train / Next.js / TypeScript | Manager dashboard, assessment packs, route logs, scoring |
+| Simulation brain | **ScenarioGraph Runtime** / TypeScript | Graph navigation, state, evidence, scoring signals, fallback policy |
+| Voice pipeline | **Audiator** / Pipecat / Python | VAD, STT pipeline, TTS pipeline, barge-in events, latency metrics |
+| TTS | Kokoro / local ONNX Docker | Self-hosted customer speech generation |
+| Media transport | LiveKit | WebRTC rooms, browser audio, future telephony/SIP |
+
+### The "Aliens" Route — First-Class, Not Fallback
+
+Off-topic utterances should be deterministic route matches, not panic fallbacks:
+
+```json
+{
+  "id": "off_topic_bizarre_or_unprofessional",
+  "candidateIntents": [
+    "bizarre_explanation",
+    "irrelevant_conspiracy",
+    "unprofessional_joke",
+    "wild_guess_without_evidence"
+  ],
+  "exampleUtterances": [
+    "maybe aliens did it",
+    "this is probably ghosts",
+    "your computer is cursed",
+    "the government is blocking your email"
+  ],
+  "customerResponses": [
+    {
+      "key": "customer_redirects_to_problem",
+      "text": "I'm not sure about that. I really just need this email sorted before my meeting.",
+      "mood": "rushed"
+    }
+  ],
+  "evidenceTags": ["off_task_unprofessional"],
+  "scoreSignals": { "professionalism": -2, "callControl": -1, "technical": -1 },
+  "nextLikelyNodes": ["problem_restatement", "ask_outbox_status", "ask_webmail_status"]
+}
+```
+
+This makes weirdness useful. It is not "fallback" — it becomes evidence.
+
+### Where Pipecat Flows Fits
+
+Pipecat Flows already gives structured conversation graphs, but do not make it the source of truth. Your graph needs assessment-specific fields that Pipecat Flows is not designed around (scoring, hidden facts, manager calibration, route-as-evidence). Use it as a voice-side adapter only.
+
+### Where XState Fits
+
+XState is a JS/TS state machine library. Use it optionally for visualization and debugging of scenario state, not as the core runtime.
+
+### Where Semantic Router Fits
+
+Semantic Router makes fast semantic decisions without slow LLM generations, using routes defined by example utterances. This maps directly to graph nodes. Each node's `examplePhrases` become router examples. Use the pattern, not the library.
+
+---
+
+## Phased Integration Plan
+
+### Phase 1 — Now (Graph + Kokoro + Route Log)
+
+Keep CX-Train mostly as-is. Add:
+
+```
+custom ScenarioGraph runtime in TypeScript
+self-hosted Kokoro via Docker (hwdsl2/docker-kokoro)
+TTS cache (data/tts-cache/)
+route log + analysis
+hardcoded Outlook Work Offline graph (12-15 nodes)
+chaos test harness (10 adversarial utterances)
+```
+
+Use **Audiator** to test this — it is already the audio playground. Do not add LiveKit yet unless the browser audio loop is blocking you.
+
+### Phase 2 — Realtime Audio Lab
+
+Move Audiator's voice loop to Pipecat:
+
+```
+Pipecat voice pipeline
+KokoroTTSService (native Pipecat support)
+Silero VAD or Pipecat VAD
+streaming STT provider
+custom ScenarioGraph adapter
+latency dashboard (show prediction vs commit times)
+```
+
+Pipecat is the best match for self-hosted Kokoro because Kokoro is now directly supported as a local/offline TTS service.
+
+### Phase 3 — Production Call Feel
+
+Add LiveKit:
+
+```
+LiveKit room per assessment attempt
+Pipecat LiveKitTransport
+Candidate joins from CX-Train browser UI
+Pipecat worker joins as the customer
+Route events stream back to CX-Train
+```
+
+This gets you barge-in, real call feel, lower-latency audio transport, and future telephony options.
+
+### Phase 4 — Offline Callum Intelligence
+
+Use LangGraph-like tools only here:
+
+```
+Callum assistant: manager pack generation
+Callum assistant: scenario graph compilation
+Callum assistant: post-call analysis
+Callum assistant: alternative route suggestions
+Callum assistant: manager calibration assistant
+Callum assistant: retry coaching
+```
+
+This is where slower agentic reasoning is valuable. Not in the live sim loop.
+
+---
+
+## Recommended Stack
+
+| Layer | Technology | When |
+|---|---|---|
+| Frontend/product | Next.js CX-Train | Now |
+| Core sim intelligence | Custom TypeScript ScenarioGraph runtime | Now |
+| Statechart help | XState (optional, viz/debug) | Phase 2 |
+| Intent routing | Custom regex + embedding router | Now (improve iteratively) |
+| Voice pipeline | Pipecat | Phase 2 |
+| TTS | Self-hosted Kokoro via Pipecat or Docker | Phase 1 (Docker), Phase 2 (Pipecat) |
+| Media transport | WebSocket → Pipecat → LiveKit | Phase 1 → Phase 2 → Phase 3 |
+| Agentic/offline | LangGraph for Callum only | Phase 4 |
+
+**Pipecat + Kokoro + your own ScenarioGraph is the best immediate technical direction.**
+**LiveKit becomes worth it when you care about barge-in, rooms, WebRTC, and production call feel.**
+**LangGraph stays out of the live sim.**
+
+---
+
 ## First Experiment
 
 Build this in audiator (the standalone lab, not CX-Train):
