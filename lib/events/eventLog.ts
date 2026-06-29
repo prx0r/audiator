@@ -1,5 +1,5 @@
-import { getDb } from '../db';
-import { SessionEvent, SessionEventType, SessionActor } from './types';
+import { getDb } from '../db.ts';
+import type { SessionEvent, SessionEventType, SessionActor } from './types.ts';
 
 export function getNextSequenceIndex(sessionId: string): number {
   const db = getDb();

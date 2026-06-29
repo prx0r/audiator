@@ -14,8 +14,6 @@ type Props = {
   disabled?: boolean;
   autoRecordTrigger?: number;
   onRecordingStarted?: (startedAtMs: number) => void;
-  flushRecordingTrigger?: number;
-  onFullRecording?: (blob: Blob, mimeType: string) => void;
 };
 
 function chooseRecorderMimeType(): string | undefined {
@@ -36,13 +34,12 @@ function audioExtension(mimeType: string): string {
 
 export function VoiceRecorderButton({
   sessionId, onTranscript, disabled, autoRecordTrigger,
-  onRecordingStarted, flushRecordingTrigger, onFullRecording,
+  onRecordingStarted,
 }: Props) {
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState('');
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
-  const fullCallChunksRef = useRef<Blob[]>([]);
   const startTimeRef = useRef<number>(0);
   const autoTriggerRef = useRef<number>(0);
 
@@ -52,18 +49,6 @@ export function VoiceRecorderButton({
       if (!disabled && !recording) startRecording();
     }
   }, [autoRecordTrigger, disabled, recording]);
-
-  const flushTriggerRef = useRef<number>(0);
-  useEffect(() => {
-    if (flushRecordingTrigger !== undefined && flushRecordingTrigger > flushTriggerRef.current) {
-      flushTriggerRef.current = flushRecordingTrigger;
-      if (fullCallChunksRef.current.length > 0 && onFullRecording) {
-        const mimeType = recorderRef.current?.mimeType || 'audio/webm';
-        const blob = new Blob(fullCallChunksRef.current, { type: mimeType });
-        onFullRecording(blob, mimeType);
-      }
-    }
-  }, [flushRecordingTrigger, onFullRecording]);
 
   useEffect(() => {
     return () => {
@@ -95,10 +80,7 @@ export function VoiceRecorderButton({
         : new MediaRecorder(stream);
 
       recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-          fullCallChunksRef.current.push(event.data);
-        }
+        if (event.data.size > 0) chunksRef.current.push(event.data);
       };
 
       recorder.onstop = async () => {

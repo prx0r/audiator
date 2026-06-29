@@ -1,0 +1,12 @@
+{
+  "name": "outlook-bad-path",
+  "turns": [
+    "we need to reinstall outlook",
+    "I will escalate this to second line",
+    "can you check if work offline is highlighted"
+  ],
+  "expect": {
+    "issueResolved": false,
+    "minRedFlags": 2
+  }
+}

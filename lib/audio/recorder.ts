@@ -26,6 +26,10 @@ export function getRecordingPath(sessionId: string, id: string): string {
   return path.join(RECORDINGS_DIR, `${sessionId}-${id}.webm`);
 }
 
+export function getMp3Path(sessionId: string, id: string): string {
+  return path.join(RECORDINGS_DIR, `${sessionId}-${id}.mp3`);
+}
+
 export function saveRecording(
   audioBuffer: Buffer,
   sessionId: string,

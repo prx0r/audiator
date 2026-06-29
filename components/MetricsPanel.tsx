@@ -22,6 +22,11 @@ interface TurnTimeline {
   sentencesPerTurn: number;
 }
 
+interface OpenSmileData {
+  numFeatures?: number;
+  features?: Record<string, number | null>;
+}
+
 interface AnalysisData {
   analysis?: AudioAnalysis;
   turnTimeline?: TurnTimeline;
@@ -30,6 +35,7 @@ interface AnalysisData {
     speakerLabels: string[];
     perSpeakerMetrics: Record<string, { totalTalkMs: number; talkRatio: number; segmentCount: number }>;
   };
+  opensmile?: OpenSmileData;
 }
 
 function timingGrade(ms: number): { label: string; color: string } {
@@ -65,6 +71,7 @@ export function MetricsPanel({ analysis }: { analysis: AnalysisData | null }) {
   const a = analysis.analysis;
   const t = analysis.turnTimeline;
   const d = analysis.diarization;
+  const os = analysis.opensmile;
 
   return (
     <div className="space-y-6">
@@ -111,6 +118,33 @@ export function MetricsPanel({ analysis }: { analysis: AnalysisData | null }) {
               <p key={speaker}>{speaker}: {(metrics.talkRatio * 100).toFixed(0)}% talk time, {metrics.segmentCount} segments</p>
             ))}
           </div>
+        </div>
+      )}
+
+      {os?.features && (
+        <div>
+          <h3 className="text-sm font-semibold text-gray-300 mb-3">openSMILE eGeMAPS</h3>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
+            {Object.entries(os.features).filter(([, v]) => v != null).slice(0, 24).map(([key, val]) => (
+              <div key={key} className="flex justify-between">
+                <span className="truncate mr-2">{key}</span>
+                <span className="font-mono text-gray-300 shrink-0">{(val as number).toFixed(3)}</span>
+              </div>
+            ))}
+          </div>
+          {Object.keys(os.features).length > 24 && (
+            <details className="text-xs text-gray-500 mt-2">
+              <summary className="cursor-pointer hover:text-gray-300">Show all {Object.keys(os.features).length} features</summary>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 mt-1">
+                {Object.entries(os.features).filter(([, v]) => v != null).slice(24).map(([key, val]) => (
+                  <div key={key} className="flex justify-between">
+                    <span className="truncate mr-2">{key}</span>
+                    <span className="font-mono text-gray-300 shrink-0">{(val as number).toFixed(3)}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
         </div>
       )}
     </div>

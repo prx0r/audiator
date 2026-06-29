@@ -1,13 +1,15 @@
 'use client';
 
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { VoiceRecorderButton, VoiceTranscriptResult } from './VoiceRecorderButton';
+import type { VoiceTranscriptResult } from './VoiceRecorderButton';
 import { useAudioPlayer } from './AudioPlayer';
+import { useLiveKit } from '@/hooks/useLiveKit';
 
 interface Message {
   role: 'customer' | 'candidate' | 'system';
   text: string;
   timestamp: number;
+  decision?: any;
 }
 
 export function VoiceChat() {
@@ -16,12 +18,18 @@ export function VoiceChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [analysis, setAnalysis] = useState<any>(null);
   const [loading, setLoading] = useState(false);
-  const flushRef = useRef(0);
-  const autoRecordRef = useRef(0);
-  const fullCallBlobRef = useRef<Blob | null>(null);
+  const [livekitMode, setLivekitMode] = useState(false);
+  const [micError, setMicError] = useState('');
+  const [isUtteranceActive, setIsUtteranceActive] = useState(false);
   const transcriptRef = useRef<string[]>([]);
-  const { speak, stop, autoplayBlocked, setOnTtsEnd } = useAudioPlayer();
+  const navigationPendingRef = useRef(false);
+  const continuousRecorderRef = useRef<MediaRecorder | null>(null);
+  const utteranceRecorderRef = useRef<MediaRecorder | null>(null);
+  const openingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const callStartRef = useRef(0);
+  const { speak, stop, setOnTtsEnd } = useAudioPlayer();
   const chatHistoryRef = useRef<Array<{ role: string; content: string }>>([]);
+  const livekit = useLiveKit();
 
   const addMessage = useCallback((msg: Message) => {
     setMessages(prev => [...prev, msg]);
@@ -39,6 +47,7 @@ export function VoiceChat() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
+          sessionId,
           history: chatHistoryRef.current,
         }),
       });
@@ -51,7 +60,7 @@ export function VoiceChat() {
       chatHistoryRef.current.push({ role: 'user', content: text });
       chatHistoryRef.current.push({ role: 'assistant', content: reply });
 
-      addMessage({ role: 'customer', text: reply, timestamp: Date.now() });
+      addMessage({ role: 'customer', text: reply, timestamp: Date.now(), decision: data.decision });
       transcriptRef.current.push(`Customer: ${reply}`);
 
       await speak(reply);
@@ -60,45 +69,122 @@ export function VoiceChat() {
     } finally {
       setLoading(false);
     }
-  }, [addMessage, speak]);
+  }, [addMessage, speak, sessionId]);
 
-  const handleFullRecording = useCallback(async (blob: Blob, mimeType: string) => {
-    if (!sessionId) return;
-
+  const sendUtteranceToStt = useCallback(async (blob: Blob, mimeType: string) => {
     const formData = new FormData();
-    formData.append('audio', blob, 'full-call.webm');
-    formData.append('session_id', sessionId);
-    formData.append('duration_ms', String(Date.now()));
+    const durationMs = Date.now();
+    formData.append('audio', blob, 'utterance.webm');
+    formData.append('duration_ms', String(durationMs));
 
     try {
-      const res = await fetch('/api/recording', { method: 'POST', body: formData });
+      const res = await fetch('/api/stt', { method: 'POST', body: formData });
       if (res.ok) {
         const data = await res.json();
-        setAnalysis(data.analysis);
-        addMessage({ role: 'system', text: 'Call saved and analyzed.', timestamp: Date.now() });
+        if (data.text?.trim()) {
+          const result: VoiceTranscriptResult = { text: data.text.trim(), durationMs, mimeType };
+          await handleTranscript(result);
+        }
+      } else {
+        console.error('STT returned', res.status);
       }
     } catch (err) {
-      console.error('Failed to upload recording:', err);
+      console.error('STT failed:', err);
     }
-  }, [sessionId, addMessage]);
+  }, [handleTranscript]);
+
+  const navigateToAnalysis = useCallback((sid: string) => {
+    window.location.href = `/analysis/${sid}`;
+  }, []);
+
+  const startUtterance = useCallback(async () => {
+    if (utteranceRecorderRef.current) return;
+    setIsUtteranceActive(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      const mimeTypes = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/ogg'];
+      const mimeType = mimeTypes.find(t => MediaRecorder.isTypeSupported(t));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      utteranceRecorderRef.current = recorder;
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        utteranceRecorderRef.current = null;
+        if (chunks.length > 0) {
+          const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || 'audio/webm' });
+          sendUtteranceToStt(blob, recorder.mimeType || mimeType || 'audio/webm');
+        }
+      };
+      recorder.start();
+    } catch (err: any) {
+      console.warn('Utterance mic failed:', err.message);
+      setIsUtteranceActive(false);
+    }
+  }, [sendUtteranceToStt]);
+
+  const stopUtterance = useCallback(() => {
+    const recorder = utteranceRecorderRef.current;
+    if (recorder && recorder.state === 'recording') {
+      recorder.stop();
+    }
+    setIsUtteranceActive(false);
+  }, []);
 
   const startCall = useCallback(async () => {
     stop();
+    if (openingTimeoutRef.current) clearTimeout(openingTimeoutRef.current);
     setMessages([]);
     setAnalysis(null);
+    setMicError('');
     transcriptRef.current = [];
     chatHistoryRef.current = [];
+    callStartRef.current = Date.now();
 
     try {
-      const res = await fetch('/api/session', { method: 'POST' });
-      const data = await res.json();
-      setSessionId(data.id);
+      let sid = sessionId;
+      let useLiveKit = false;
 
-      addMessage({ role: 'system', text: 'Call started. Hold the mic to speak.', timestamp: Date.now() });
+      try {
+        const lkData = await livekit.startCall();
+        sid = lkData.sessionId;
+        useLiveKit = true;
+      } catch {
+        const res = await fetch('/api/session', { method: 'POST' });
+        const data = await res.json();
+        sid = data.id;
+      }
+
+      setSessionId(sid);
+      setLivekitMode(useLiveKit);
+
+      if (!useLiveKit) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+            video: false,
+          });
+          const mimeTypes = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/ogg'];
+          const mimeType = mimeTypes.find(t => MediaRecorder.isTypeSupported(t));
+          const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+          continuousRecorderRef.current = recorder;
+          recorder.start();
+        } catch (err: any) {
+          console.warn('Continuous mic unavailable:', err.message);
+          setMicError(err.name === 'NotAllowedError' ? 'Mic permission denied' : 'No mic available');
+        }
+      }
+
+      addMessage({ role: 'system', text: useLiveKit ? 'LiveKit call started.' : 'Call started.', timestamp: Date.now() });
       setCallActive(true);
 
-      setTimeout(() => {
-        const opening = 'Hi, I\'m having trouble with my computer — can you help?';
+      openingTimeoutRef.current = setTimeout(() => {
+        const opening = "Hi, this is Sarah in the office. Outlook won't send an email and I need it gone before my meeting.";
         addMessage({ role: 'customer', text: opening, timestamp: Date.now() });
         transcriptRef.current.push(`Customer: ${opening}`);
         speak(opening);
@@ -106,32 +192,86 @@ export function VoiceChat() {
     } catch (err: any) {
       addMessage({ role: 'system', text: `Failed to start call: ${err.message}`, timestamp: Date.now() });
     }
-  }, [addMessage, speak, stop]);
+  }, [addMessage, speak, stop, livekit, sessionId]);
 
   const endCall = useCallback(async () => {
     stop();
+    if (openingTimeoutRef.current) clearTimeout(openingTimeoutRef.current);
     setCallActive(false);
+    setIsUtteranceActive(false);
+    navigationPendingRef.current = true;
+    addMessage({ role: 'system', text: 'Call ended. Analyzing...', timestamp: Date.now() });
 
-    if (sessionId) {
+    stopUtterance();
+
+    if (livekitMode) {
+      await livekit.endCall();
+    } else if (sessionId) {
       await fetch('/api/session', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: sessionId, status: 'completed' }),
       });
-
-      flushRef.current++;
     }
 
-    addMessage({ role: 'system', text: 'Call ended. Analyzing...', timestamp: Date.now() });
-  }, [sessionId, addMessage, stop]);
+    const recorder = continuousRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      const mimeType = recorder.mimeType || 'audio/webm';
+      const blob = await new Promise<Blob | null>((resolve) => {
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            resolve(new Blob([e.data], { type: mimeType }));
+          } else {
+            resolve(null);
+          }
+        };
+        recorder.stop();
+      });
+      recorder.stream.getTracks().forEach(t => t.stop());
+
+      if (blob && sessionId) {
+        try {
+          const formData = new FormData();
+          formData.append('audio', blob, 'full-call.webm');
+          formData.append('session_id', sessionId);
+          formData.append('duration_ms', String(Date.now() - callStartRef.current));
+          const res = await fetch('/api/recording', { method: 'POST', body: formData });
+          if (res.ok) {
+            const data = await res.json();
+            setAnalysis(data.analysis);
+          }
+        } catch (err) {
+          console.error('Failed to upload recording:', err);
+        }
+      }
+    }
+
+    if (sessionId) {
+      navigationPendingRef.current = false;
+      navigateToAnalysis(sessionId);
+    }
+  }, [sessionId, addMessage, stop, livekit, livekitMode, navigateToAnalysis, stopUtterance]);
 
   useEffect(() => {
     setOnTtsEnd(() => {
-      autoRecordRef.current++;
+      startUtterance();
     });
-  }, [setOnTtsEnd]);
+  }, [setOnTtsEnd, startUtterance]);
+
+  useEffect(() => {
+    return () => {
+      if (openingTimeoutRef.current) clearTimeout(openingTimeoutRef.current);
+      for (const r of [continuousRecorderRef.current, utteranceRecorderRef.current]) {
+        if (r && r.state !== 'inactive') {
+          r.stream?.getTracks().forEach(t => t.stop());
+          r.stop();
+        }
+      }
+    };
+  }, []);
 
   const messagesForTranscript = messages.filter(m => m.role !== 'system');
+  const lastDecision = messages.filter(m => m.decision).pop()?.decision;
 
   return (
     <div className="flex flex-col h-full">
@@ -162,6 +302,14 @@ export function VoiceChat() {
       </div>
 
       <div className="border-t border-gray-700 p-4 space-y-3">
+        {livekitMode && <div className="text-xs text-green-400">LiveKit transport active</div>}
+
+        {micError && (
+          <div className="text-xs text-yellow-400 bg-yellow-900/20 rounded px-3 py-2">
+            {micError} — audio analysis will be unavailable
+          </div>
+        )}
+
         {analysis && (
           <div className="bg-gray-800 rounded-lg p-3 text-xs text-gray-300">
             <p className="font-semibold text-gray-200 mb-1">Call Analysis</p>
@@ -183,15 +331,23 @@ export function VoiceChat() {
             </button>
           ) : (
             <>
-              <VoiceRecorderButton
-                sessionId={sessionId || ''}
-                onTranscript={handleTranscript}
-                disabled={loading}
-                autoRecordTrigger={autoRecordRef.current}
-                onRecordingStarted={() => {}}
-                flushRecordingTrigger={flushRef.current}
-                onFullRecording={handleFullRecording}
-              />
+              {!livekitMode && (
+                <button
+                  type="button"
+                  onClick={isUtteranceActive ? stopUtterance : startUtterance}
+                  disabled={!isUtteranceActive && loading}
+                  className={`select-none rounded px-5 py-2.5 text-sm font-medium transition-all ${
+                    isUtteranceActive
+                      ? 'bg-red-600 text-white ring-2 ring-red-400 animate-pulse'
+                      : 'bg-blue-600 text-white hover:bg-blue-700'
+                  } ${!isUtteranceActive && loading ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                >
+                  {isUtteranceActive ? 'Stop' : 'Talk'}
+                </button>
+              )}
+              {livekitMode && (
+                <div className="text-sm text-gray-400">{livekit.audioElement}LiveKit connected — speak freely</div>
+              )}
               <button
                 onClick={endCall}
                 className="bg-red-600 hover:bg-red-700 text-white px-4 py-2.5 rounded-lg text-sm font-medium"
@@ -201,6 +357,17 @@ export function VoiceChat() {
             </>
           )}
         </div>
+
+        {lastDecision && lastDecision.evidenceTags?.length > 0 && (
+          <details className="text-xs text-gray-500">
+            <summary className="cursor-pointer hover:text-gray-300">Last turn tags</summary>
+            <div className="mt-1 space-y-0.5">
+              {lastDecision.evidenceTags.map((tag: string) => (
+                <span key={tag} className="text-[9px] bg-gray-700 text-gray-300 px-1 py-0.5 rounded">{tag}</span>
+              ))}
+            </div>
+          </details>
+        )}
 
         {messagesForTranscript.length > 0 && (
           <details className="text-xs text-gray-500">

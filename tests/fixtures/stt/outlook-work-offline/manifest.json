@@ -1,0 +1,62 @@
+[
+  {
+    "file": "ask-work-offline-01.wav",
+    "expectedText": "can you check if work offline is highlighted",
+    "expectedIntent": "ask_work_offline_status"
+  },
+  {
+    "file": "ask-work-offline-02.wav",
+    "expectedText": "is the work offline button on",
+    "expectedIntent": "ask_work_offline_status"
+  },
+  {
+    "file": "check-outbox-01.wav",
+    "expectedText": "is it stuck in your outbox",
+    "expectedIntent": "ask_outbox_status"
+  },
+  {
+    "file": "check-outbox-02.wav",
+    "expectedText": "can you check the outbox",
+    "expectedIntent": "ask_outbox_status"
+  },
+  {
+    "file": "problem-summary-01.wav",
+    "expectedText": "can you tell me what is happening",
+    "expectedIntent": "ask_problem_summary"
+  },
+  {
+    "file": "error-message-01.wav",
+    "expectedText": "do you see an error message",
+    "expectedIntent": "ask_error_message"
+  },
+  {
+    "file": "send-receive-01.wav",
+    "expectedText": "can you go to send receive",
+    "expectedIntent": "ask_send_receive_status"
+  },
+  {
+    "file": "disable-offline-01.wav",
+    "expectedText": "click work offline to turn it off",
+    "expectedIntent": "disable_work_offline"
+  },
+  {
+    "file": "test-email-01.wav",
+    "expectedText": "try sending a test email",
+    "expectedIntent": "send_test_email"
+  },
+  {
+    "file": "confirm-resolution-01.wav",
+    "expectedText": "has that fixed the issue",
+    "expectedIntent": "confirm_resolution"
+  },
+  {
+    "file": "off-topic-01.wav",
+    "expectedText": "maybe aliens broke outlook",
+    "expectedIntent": "off_topic_bizarre"
+  },
+  {
+    "file": "bad-reinstall-01.wav",
+    "expectedText": "we need to reinstall outlook",
+    "expectedIntent": "bad_reinstall_outlook"
+  }
+]

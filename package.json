@@ -8,14 +8,21 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "tsc --noEmit && node --test tests/audio-analysis.test.ts",
+    "test": "tsc --noEmit && node --test tests/*.test.ts",
     "test:audio": "node --test tests/audio-analysis.test.ts",
     "test:openrouter": "node scripts/test-openrouter.mjs",
-    "download:diarization": "bash scripts/download-diarization-models.sh"
+    "download:diarization": "bash scripts/download-diarization-models.sh",
+    "simulate:call": "node scripts/simulate-call.mjs",
+    "benchmark:stt": "node scripts/benchmark-stt.mjs",
+    "benchmark:tts": "node scripts/benchmark-tts.mjs",
+    "smoke:livekit": "node scripts/smoke-livekit-room.mjs"
   },
   "dependencies": {
     "audio-decode": "^3.11.0",
     "better-sqlite3": "^11.10.0",
+    "livekit-client": "^2.20.0",
+    "livekit-server-sdk": "^2.15.5",
+    "natural": "^8.1.1",
     "next": "14.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

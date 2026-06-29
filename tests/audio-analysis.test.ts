@@ -1,6 +1,6 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
-import { analyzeAudio } from '../lib/audio/analyzer';
+import { analyzeAudio } from '../lib/audio/analyzer.ts';
 import {
   saveRecording,
   getRecordingStream,
@@ -8,7 +8,7 @@ import {
   deleteRecording,
   listRecordings,
   generateRecordingId,
-} from '../lib/audio/recorder';
+} from '../lib/audio/recorder.ts';
 import fs from 'fs';
 import path from 'path';
 

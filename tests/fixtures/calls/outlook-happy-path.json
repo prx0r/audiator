@@ -1,0 +1,13 @@
+{
+  "name": "outlook-happy-path",
+  "turns": [
+    "can you check if work offline is highlighted",
+    "click work offline to turn it off",
+    "try sending a test email",
+    "can I confirm that resolved it"
+  ],
+  "expect": {
+    "issueResolved": true,
+    "maxPressure": 45
+  }
+}

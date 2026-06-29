@@ -47,10 +47,23 @@ export async function GET(req: NextRequest) {
 
     if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 });
 
-    const events = db.prepare('SELECT * FROM session_events WHERE session_id = ? ORDER BY sequence_index ASC').all(id);
-    const recording = db.prepare('SELECT * FROM recordings WHERE session_id = ? ORDER BY created_at DESC LIMIT 1').get(id);
+    const events = (db.prepare('SELECT * FROM session_events WHERE session_id = ? ORDER BY sequence_index ASC').all(id) as any[]).map(e => ({
+      ...e,
+      payload_json: e.payload_json ? JSON.parse(e.payload_json) : null,
+    }));
+    const recordingRow = db.prepare('SELECT * FROM recordings WHERE session_id = ? ORDER BY created_at DESC LIMIT 1').get(id) as Record<string, unknown> | undefined;
 
-    return NextResponse.json({ session, events, recording });
+    let mp3Url = null;
+    let recording = null;
+    if (recordingRow) {
+      recording = {
+        ...recordingRow,
+        analysis_json: recordingRow.analysis_json ? JSON.parse(recordingRow.analysis_json as string) : null,
+      };
+      mp3Url = `/api/recording?session_id=${id}&id=${recordingRow.id}&format=mp3`;
+    }
+
+    return NextResponse.json({ session, events, recording, mp3Url });
   } catch (err: any) {
     console.error('[Session] Get error:', err.message);
     return NextResponse.json({ error: 'Failed to get session' }, { status: 500 });

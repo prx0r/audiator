@@ -1,0 +1,12 @@
+{
+  "name": "outlook-off-topic",
+  "turns": [
+    "maybe aliens cursed outlook",
+    "what problem are you having",
+    "is it stuck in your outbox"
+  ],
+  "expect": {
+    "issueResolved": false,
+    "minRedFlags": 1
+  }
+}

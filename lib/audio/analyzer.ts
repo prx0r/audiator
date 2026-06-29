@@ -1,4 +1,5 @@
 import decodeAudio from 'audio-decode';
+import fs from 'fs';
 
 export interface AudioSegment {
   startMs: number;
@@ -41,14 +42,10 @@ type DecodedAudio = {
   sampleRate: number;
 };
 
-export async function analyzeAudio(audioData: Uint8Array): Promise<AudioAnalysis> {
-  const decoded = await decodeAudio(audioData.buffer as ArrayBuffer) as unknown as DecodedAudio;
-  const sampleRate = decoded.sampleRate;
-  const channels = decoded.channelData.length;
-  const channelData = decoded.channelData[0];
+function runRmsAnalysis(channelData: Float32Array, sampleRate: number): AudioAnalysis {
   const totalSamples = channelData.length;
   const windowSamples = Math.floor(sampleRate * WINDOW_MS / 1000);
-  const totalDurationMs = (totalSamples / sampleRate) * 1000;
+  const totalDurationMs = totalSamples > 0 ? (totalSamples / sampleRate) * 1000 : 0;
 
   const segments: AudioSegment[] = [];
   let currentType: 'speech' | 'silence' | null = null;
@@ -135,7 +132,7 @@ export async function analyzeAudio(audioData: Uint8Array): Promise<AudioAnalysis
   return {
     durationMs: Math.round(totalDurationMs),
     sampleRate,
-    channels,
+    channels: 1,
     totalSilenceMs: Math.round(totalSilenceMs),
     silenceRatio: totalDurationMs > 0 ? Math.round((totalSilenceMs / totalDurationMs) * 1000) / 1000 : 0,
     longestSilenceMs: Math.round(longestSilenceMs),
@@ -147,4 +144,68 @@ export async function analyzeAudio(audioData: Uint8Array): Promise<AudioAnalysis
     rmsVariance: Math.round(rmsVariance * 1000) / 1000,
     segments,
   };
+}
+
+export function parseWav(buffer: Buffer): DecodedAudio {
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const sampleRate = view.getUint32(24, true);
+  const bitsPerSample = view.getUint16(34, true);
+  const numChannels = view.getUint16(22, true);
+
+  let dataOffset = 44;
+  let dataSize = view.getUint32(40, true);
+  if (buffer.slice(36, 40).toString() !== 'data') {
+    let pos = 12;
+    while (pos < buffer.length - 8) {
+      const chunkSize = view.getUint32(pos + 4, true);
+      if (buffer.slice(pos, pos + 4).toString() === 'data') {
+        dataOffset = pos + 8;
+        dataSize = chunkSize;
+        break;
+      }
+      pos += 8 + chunkSize;
+    }
+  }
+
+  const bytesPerSample = bitsPerSample / 8;
+  const totalSamples = Math.floor(dataSize / bytesPerSample);
+  const samplesPerChannel = Math.floor(totalSamples / numChannels);
+
+  const channelData: Float32Array[] = [];
+  for (let ch = 0; ch < numChannels; ch++) {
+    channelData.push(new Float32Array(samplesPerChannel));
+  }
+
+  for (let i = 0; i < totalSamples; i++) {
+    const byteOffset = dataOffset + i * bytesPerSample;
+    let sample: number;
+    if (bitsPerSample === 16) {
+      sample = view.getInt16(byteOffset, true) / 32768;
+    } else if (bitsPerSample === 32) {
+      sample = view.getInt32(byteOffset, true) / 2147483648;
+    } else if (bitsPerSample === 8) {
+      sample = (view.getUint8(byteOffset) - 128) / 128;
+    } else if (bitsPerSample === 24) {
+      const val = view.getUint8(byteOffset) | (view.getUint8(byteOffset + 1) << 8) | (view.getUint8(byteOffset + 2) << 16);
+      sample = (val >> 7) & 1 ? (val | 0xff000000) / 8388608 : val / 8388608;
+    } else {
+      sample = 0;
+    }
+    const ch = i % numChannels;
+    const idx = Math.floor(i / numChannels);
+    channelData[ch][idx] = sample;
+  }
+
+  return { channelData, sampleRate };
+}
+
+export async function analyzeAudio(audioData: Uint8Array): Promise<AudioAnalysis> {
+  const decoded = await decodeAudio(audioData.buffer as ArrayBuffer) as unknown as DecodedAudio;
+  return runRmsAnalysis(decoded.channelData[0], decoded.sampleRate);
+}
+
+export async function analyzeWavFile(wavPath: string): Promise<AudioAnalysis> {
+  const buffer = fs.readFileSync(wavPath);
+  const decoded = await decodeAudio(buffer.buffer as ArrayBuffer) as unknown as DecodedAudio;
+  return runRmsAnalysis(decoded.channelData[0], decoded.sampleRate);
 }
