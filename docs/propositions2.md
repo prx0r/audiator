@@ -396,7 +396,7 @@ LiveKit is a **WebRTC media router / SFU** — it moves audio around. It does no
 | Component | GPU Required? |
 |---|---|
 | LiveKit server (SFU) | **No** — Go binary, pure CPU |
-| Pipecat voice worker | No, unless your STT/TTS models need it |
+| Pipecat/AI worker | No, unless your STT/TTS models need it |
 | Kokoro TTS | No — runs on CPU via ONNX |
 | Whisper/local STT | CPU possible (slower), GPU helps |
 | LLM | API-based (no GPU) or local (GPU if self-hosted) |
@@ -407,15 +407,12 @@ LiveKit itself is not the expensive bit.
 
 | Scenario | Cost |
 |---|---|
-| Self-hosted (local dev / your Hetzner) | Software is free. Pay only for the machine. |
-| Self-hosted (production) | Server cost + your ops burden |
+| Self-hosted (your Hetzner) | **Free software.** Pay only for the box. |
 | LiveKit Cloud | Metered: WebRTC minutes, agent sessions, STT/TTS/LLM per-minute |
-
-Self-hosting on your Hetzner 2-core box: LiveKit server uses minimal CPU/RAM. It will run fine alongside Next.js and Kokoro for a prototype.
 
 ### Is It Easy to Add?
 
-For a basic audio room: yes (~30 mins to get a room running). For a full voice agent pipeline with graph prediction, cached audio, and scoring: medium complexity.
+For a basic audio room: ~30 minutes. For a full voice agent pipeline with graph prediction, cached audio, and scoring: medium complexity — but the hard part is **the worker** (ScenarioGraph, intent matcher, preload manager), not LiveKit.
 
 The minimum viable integration:
 
@@ -424,37 +421,380 @@ The minimum viable integration:
 2. Backend creates LiveKit room + access token
 3. Candidate browser joins room
 4. Voice worker joins same room as "customer"
-5. Candidate speaks
-6. Worker receives audio
-7. Worker runs STT → ScenarioGraph → TTS/cache
-8. Worker publishes customer audio back into room
-9. Worker sends route events to CX-Train
+5. Candidate speaks → worker receives audio
+6. Worker runs STT → ScenarioGraph → TTS/cache
+7. Worker publishes customer audio back into room
+8. Worker sends route events to CX-Train
 ```
-
-The hard part is not LiveKit. The hard part is **the worker** — the ScenarioGraph runtime, intent matcher, preload manager, and fallback policy.
 
 ### Should You Add It Now?
 
-**Not yet for CX-Train mainline.** Add it in Audiator first.
-
-Your current priority is proving:
-
-```
-partial transcript → graph prediction → preload cached Kokoro audio → instant response
-```
-
-You can test that without LiveKit using the existing browser/audio loop. Once that works, LiveKit becomes worth adding because it gives you:
+**Yes — build with LiveKit now.** If you are only running one conversation at a time, there is no migration cost later. The alternative (MediaRecorder + HTTP blobs) is a dead end you will have to replace anyway. LiveKit gives you from day one:
 
 - Real WebRTC call feel
-- Barge-in / interruptions
-- Clean room-per-attempt architecture
-- Better audio transport (no HTTP-blob-upload dance)
-- Future SIP/phone-call direction
-- Agent joins as a participant, not a hidden process
+- Barge-in / interruptions (native `allow_interruptions`)
+- Clean room-per-attempt isolation
+- Agent joins as a participant
+- Future SIP/telephony path
 
-### Blunt Conclusion
+### But What About the Box?
 
-LiveKit is not a GPU problem and not the expensive AI part. It is a **transport upgrade**. Use it when you want the sim to feel like a real call. But the thing that makes CallCallum smart is still the ScenarioGraph + intent matching + preloaded responses + route-as-evidence scoring. Build that first.
+On your Hetzner 2-core/4GB during prototyping:
+
+| Service | Resources |
+|---|---|
+| LiveKit server | Minimal (Go binary) |
+| CX-Train / Next.js | One Node process |
+| ScenarioGraph runtime | Same Node process |
+| Kokoro cache playback | Filesystem read |
+| Kokoro generation | ~300MB, one CPU core (occasional) |
+| **External STT** | API call — no local load |
+| **External LLM** | API call — no local load |
+
+Runs fine. Keep STT and LLM as external APIs during prototype.
+
+---
+
+## The Best Product Shape
+
+The candidate clicks the assessment link and enters a fake service desk screen:
+
+```
+- Call panel
+- Customer name/company
+- Ticket description / hidden facts
+- Notes field
+- Triage fields
+- Timer
+- Call start button
+```
+
+They press **Start Call**. Behind the scenes:
+
+```
+CX-Train creates LiveKit room
+Candidate browser joins room
+Customer AI worker joins as customer
+ScenarioGraph loads simpack
+Customer opens with cached/preloaded audio
+Candidate speaks naturally
+Customer responds, interrupts, gets frustrated, calms down, or redirects
+Route log records every competence signal
+```
+
+This starts feeling like a real call, not a chat-with-a-mic exercise.
+
+---
+
+## Customer Profile: The Pressure Meter
+
+Interruptions should not be random. They should emerge from a **customer profile** in the simpack:
+
+```json
+{
+  "id": "urgent_angry_office_manager",
+  "name": "Sarah Mitchell",
+  "role": "Office Manager",
+  "mood": "urgent",
+  "voice": "bf_emma",
+  "patienceStart": 45,
+  "angerThreshold": 75,
+  "interruptionStyle": "rushed",
+  "interruptions": {
+    "enabled": true,
+    "minSecondsBeforeInterrupt": 4,
+    "triggerPressureAbove": 70,
+    "silenceMsBeforePrompt": 2500,
+    "wrongPathInterrupt": true,
+    "jargonInterrupt": true
+  },
+  "interruptLines": {
+    "silence": "Hello? Are you still there?",
+    "wrongPath": "I don't really have time for that — I just need this email sent.",
+    "jargon": "I don't know what that means. Can you just tell me what to click?",
+    "bizarre": "I'm not sure about that. I really need this sorting.",
+    "repeated": "You already asked me that. What should I do next?"
+  }
+}
+```
+
+### Pressure Increases When Candidate:
+
+- wastes time
+- gives vague instructions
+- uses jargon
+- says something bizarre
+- goes down wrong path
+- repeats themselves
+- ignores urgency
+- silent too long
+- irrelevant small talk
+- fails to take ownership
+
+### Pressure Decreases When Candidate:
+
+- reassures clearly
+- explains simply
+- gives one instruction at a time
+- shows progress
+- acknowledges urgency
+- confirms impact
+- keeps control of the call
+
+The customer butts in when pressure exceeds the threshold. The entire mechanic is deterministic — driven by graph node evidence tags and score signals.
+
+---
+
+## The Customer Worker Decision Loop
+
+Every turn produces a structured decision object:
+
+```typescript
+type CustomerDecision = {
+  matchedNodes: string[];
+  primaryIntent: string;
+  softSkillModifiers: string[];
+  redFlags: string[];
+  customerResponseText: string;
+  responseMode: "cached" | "cached_plus_generated" | "redirect" | "fallback";
+  audioCacheKey?: string;
+  pressureDelta: number;
+  stateUpdates: Record<string, unknown>;
+  evidenceTags: string[];
+  scoreSignals: {
+    technical?: number;
+    communication?: number;
+    callControl?: number;
+    professionalism?: number;
+  };
+  nextLikelyNodes: string[];
+};
+```
+
+The audio is just how the candidate experiences it. This decision object is the product.
+
+---
+
+## The Simpack Schema
+
+```
+simpack/
+  metadata
+  customerProfile
+  technicalState
+  openingLine
+  graphNodes
+  offGraphRoutes
+  interruptionPolicy
+  scoringRubric
+  hiddenFacts
+  allowedCustomerKnowledge
+  responseVoice
+  preloadPlan
+```
+
+Example:
+
+```json
+{
+  "id": "outlook_work_offline_v1",
+  "customerProfile": {
+    "name": "Sarah Mitchell",
+    "role": "Office Manager",
+    "mood": "urgent",
+    "patienceStart": 50,
+    "angerThreshold": 75,
+    "interruptionStyle": "rushed",
+    "voice": "bf_emma"
+  },
+  "technicalState": {
+    "internetWorks": true,
+    "webmailWorks": true,
+    "outboxHasEmail": true,
+    "workOfflineEnabled": true,
+    "issueResolved": false
+  },
+  "interruptionPolicy": {
+    "enabled": true,
+    "silenceMs": 2500,
+    "wrongPathPressureDelta": 18,
+    "jargonPressureDelta": 10,
+    "empathyPressureDelta": -8,
+    "clearProgressPressureDelta": -12
+  }
+}
+```
+
+Graph node:
+
+```json
+{
+  "id": "ask_work_offline_status",
+  "candidateIntents": ["ask_work_offline_status"],
+  "exampleUtterances": [
+    "Can you check if Work Offline is highlighted?",
+    "Is the Work Offline button turned on?"
+  ],
+  "preconditions": ["outlookOpen"],
+  "stateUpdates": { "workOfflineChecked": true },
+  "customerResponses": [
+    {
+      "key": "work_offline_is_on_rushed",
+      "text": "Yeah, it is highlighted. Is that why this isn't sending?",
+      "mood": "rushed"
+    }
+  ],
+  "evidenceTags": ["checked_work_offline"],
+  "scoreSignals": { "technical": 2 },
+  "nextLikelyNodes": ["disable_work_offline", "explain_work_offline", "send_test_email"]
+}
+```
+
+Off-graph route:
+
+```json
+{
+  "id": "off_topic_bizarre",
+  "exampleUtterances": ["aliens", "ghosts", "cursed", "government conspiracy"],
+  "customerResponses": [
+    {
+      "key": "redirect_bizarre_rushed",
+      "text": "I'm not sure about that. I really need this email sorted before my meeting."
+    }
+  ],
+  "scoreSignals": { "professionalism": -2, "callControl": -1 },
+  "pressureDelta": 15,
+  "nextLikelyNodes": ["problem_restatement", "ask_outbox_status"]
+}
+```
+
+---
+
+## Product Behaviour Examples
+
+### Candidate is efficient
+> Candidate: "Can you check if webmail works?"
+> Customer: "Yes, webmail loads fine."
+> Pressure: -5 | Score: good scope isolation
+
+### Candidate is empathetic
+> Candidate: "I know this is stressful before a meeting, I'll keep this quick."
+> Customer: "Thanks, I appreciate it."
+> Pressure: -10 | Score: communication + ownership
+
+### Candidate wastes time with jargon
+> Candidate: "Could be DNS, maybe the router, maybe Microsoft, maybe profile corruption..."
+> Customer interrupts: "Sorry, I don't really know what that means. What do you need me to do?"
+> Pressure: +15 | Score: jargon / poor call control
+
+### Candidate says aliens
+> Candidate: "Maybe aliens got into Outlook."
+> Customer: "I'm not sure about that. I really need this sorting."
+> Pressure: +20 | Score: professionalism red flag
+
+### Candidate adds "are you okay?"
+> Candidate: "Can you check Work Offline? Also, are you okay? You sound stressed."
+> Customer: "I'm just stressed because of this meeting. And yes, Work Offline is highlighted."
+> Pressure: -6 | Score: empathy + correct diagnostic action
+
+This is the sweet spot: technical graph + emotional overlay.
+
+---
+
+## Pipecat or LiveKit Agents?
+
+| Approach | Pros | Cons |
+|---|---|---|
+| **LiveKit Agents directly** | Fewer moving parts, built-in `session.say()`, `allow_interruptions`, agent sessions | Less flexible for custom voice pipelines |
+| **Pipecat + LiveKitTransport** | More flexible voice pipeline, KokoroTTSService built in, VAD/STT/TTS orchestration | Extra Python service to run |
+
+**Recommendation:** Start with **LiveKit Agents directly**. Your hard problem is not pipeline orchestration — it is the ScenarioGraph + scoring + interruptions + pressure meter. Keep the voice transport simple. Add Pipecat later if you need more pipeline control.
+
+---
+
+## Phased Plan (Updated)
+
+### Phase 1 — LiveKit + Hardcoded Graph (Now)
+
+```
+LiveKit room per assessment attempt
+Customer worker joins as "Customer"
+Hardcoded Outlook Work Offline simpack
+Customer profile with pressure meter
+Deterministic interruption policy
+Kokoro cached audio (self-hosted Docker)
+External STT (OpenRouter Whisper)
+External LLM fallback (OpenRouter)
+Route log → CX-Train
+Manager review page: route, pressure curve, red flags, missed faster path
+```
+
+### Phase 2 — ScenarioGraph Compiler
+
+```
+Callum generates graph from manager script
+Graph editor / approval UI
+Multiple sim packs
+Graph versioning
+```
+
+### Phase 3 — Pipecat (If Needed)
+
+```
+Pipecat voice pipeline for more control
+KokoroTTSService integration
+Custom VAD / streaming STT orchestration
+Latency dashboard
+```
+
+### Phase 4 — Callum Intelligence
+
+```
+LangGraph for offline analysis
+Manager calibration assistant
+Retry coaching
+Alternative route suggestions
+```
+
+---
+
+## The Version I Would Build Now
+
+1. Add LiveKit room per assessment attempt.
+2. Add customer worker that joins as "Customer".
+3. Add hardcoded Outlook Work Offline simpack.
+4. Add customerProfile + pressure meter.
+5. Add deterministic interruption policy.
+6. Add Kokoro cached lines.
+7. Use external STT at first.
+8. Log every graph decision to CX-Train.
+9. Add review page showing: route, pressure curve, red flags, missed faster path.
+
+The review page should show:
+
+```
+Turn 1:
+  Candidate asked problem summary.
+  Good.
+
+Turn 2:
+  Candidate checked internet but did not check webmail.
+  Okay.
+
+Turn 3:
+  Candidate used jargon; customer pressure rose.
+  Communication issue.
+
+Turn 4:
+  Candidate identified Work Offline.
+  Strong diagnostic action.
+
+Turn 5:
+  Candidate confirmed test send.
+  Resolved.
+```
+
+That is what managers will actually care about.
 
 ---
 
