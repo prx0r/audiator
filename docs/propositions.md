@@ -629,6 +629,447 @@ Per-turn features from Parselmouth:
 
 ---
 
+## Architectural Foundations: Dialogue Graph, Predictive Cache, Voice Transport
+
+*Beyond the audio/emotion extractors above, these 9 projects define the architectural patterns for the live sim engine. The strongest CallCallum architecture is a hybrid — borrow the right pattern from each, adopt none wholesale.*
+
+### 1. Rasa — Dialogue Graph / Intent Engine Foundation
+
+**Repo:** https://github.com/RasaHQ/rasa
+**Stars:** 19k+ | **License:** Apache 2.0
+
+#### What It Is
+Open-source framework for text/voice conversations with NLU, dialogue management, intents, stories/rules, slots, and actions. The classic reference for intent-driven conversational state machines.
+
+#### How It Maps
+Rasa is the closest old-school version of the Conversation Response Graph:
+
+```
+candidate phrase → intent → dialogue state → response/action
+```
+
+For CallCallum:
+```
+candidate phrase → support action intent → scenario state → customer response → evidence event
+```
+
+Example:
+- Candidate: *"Are there emails stuck in your Outbox?"*
+- Intent: `ask_outbox_status`
+- State update: `outbox_checked = true`
+- Customer response: *"Yeah, there are three sitting there."*
+- Evidence tag: `checked_outbox`
+
+#### Architecture If Based on Rasa
+```
+SimPack → generated Rasa-style intents/stories/rules
+        → runtime dialogue manager
+        → custom actions update scenario state
+        → event log records route
+        → analysis compares route vs ideal path
+```
+
+#### What to Borrow
+The mental model — not the framework:
+- intents, slots, stories/rules, actions, fallbacks, conversation state
+
+#### Why Not Use It Directly
+Rasa is heavy and product-shaped around general chatbots. The classic open-source framework is legacy/maintenance-ish (newer CALM/Rasa Pro direction). For a Next.js/SQLite MVP, full Rasa embedding would be friction.
+
+#### Verdict
+**Best conceptual foundation.** Do not make Rasa the core dependency, but copy its structure. CallCallum version = Rasa-like dialogue graph, domain-specific to MSP simulation and scoring.
+
+---
+
+### 2. VoiceAgentRAG (Salesforce) — Predictive Cache / Slow-Thinker Fast-Talker
+
+**Repo:** https://github.com/SalesforceAIResearch/VoiceAgentRAG
+**Stars:** ~1k | **License:** BSD-3
+
+#### What It Is
+Dual-agent pattern: a background **Slow Thinker** predicts likely follow-up topics and prefetches context into a fast cache, while a foreground **Fast Talker** reads from that cache to reduce latency.
+
+#### How It Maps
+Extremely close to the "preload likely responses" idea:
+
+```
+Their structure:
+  conversation so far → Slow Thinker predicts likely next context
+                      → prefetch into cache
+                      → Fast Talker answers instantly if cache hit
+
+Your structure:
+  scenario state + expected path → Slow Thinker predicts likely candidate next actions
+                                 → preload customer response text/audio
+                                 → Fast Talker plays cached response if candidate matches
+```
+
+#### Architecture If Based on VoiceAgentRAG
+```
+Background predictor:
+  - watches current scenario state
+  - predicts likely next candidate intents
+  - warms response/audio cache
+
+Foreground runtime:
+  - classifies candidate utterance
+  - checks cache for matching node response
+  - plays cached audio immediately
+  - falls back to LLM/TTS only on miss
+```
+
+#### What to Borrow
+Almost everything conceptually: Slow Thinker, Fast Talker, semantic cache, cache hit/miss logging, priority retrieval on miss.
+
+**CallCallum-specific twist:** They prefetch documents. You prefetch customer response text, customer audio, scenario state transition, evidence tags, and next likely graph nodes.
+
+#### Verdict
+**Most important architecture for latency.** If Rasa gives the graph, VoiceAgentRAG gives the predictive cache. Your best architecture = Rasa-style graph + VoiceAgentRAG-style prefetch cache.
+
+---
+
+### 3. Pipecat — Realtime Voice Pipeline Foundation
+
+**Repo:** https://github.com/pipecat-ai/pipecat
+**Examples:** https://github.com/pipecat-ai/pipecat-examples
+**Stars:** ~7k | **License:** BSD-3
+
+#### What It Is
+Open-source Python framework for real-time voice and multimodal AI agents. Orchestrates audio/video, AI services, transports, and conversation pipelines with multi-agent support.
+
+#### How It Maps
+Pipecat is about the voice plumbing — less about graph simulation, more about audio transport, STT pipeline, LLM streaming, TTS streaming, interruptions, WebRTC/WebSocket realtime flows.
+
+#### Architecture If Based on Pipecat
+```
+Next.js app = dashboard/sim UI
+Python Pipecat service = realtime voice runtime
+CallCallum scenario engine = graph/state/evidence service
+TTS/STT providers = plugged into Pipecat
+
+Flow: candidate audio → Pipecat pipeline → STT partials
+      → CallCallum graph matcher → cached/preloaded response or LLM fallback
+      → TTS → candidate hears customer
+```
+
+#### What to Borrow
+Realtime pipeline structure: transport layer, audio frames, pipeline processors, interrupt handling, service adapters, streaming architecture.
+
+#### Downsides
+Adds a Python service next to the Next.js app. Heavier for MVP but appropriate for the audio lab.
+
+#### Verdict
+**Best if you want a serious realtime voice service.** Use Pipecat in the separate audio/voice lab before wiring into CX-Train.
+
+---
+
+### 4. LiveKit Agents — Production Realtime Voice / Transport
+
+**Repo:** https://github.com/livekit/agents | https://github.com/livekit/agents-js
+**Examples:** https://github.com/livekit-examples/python-agents-examples
+**Stars:** ~5k | **License:** Apache 2.0
+
+#### What It Is
+Production-grade realtime programmable participants — rooms, participants, WebRTC, agent sessions, telephony. Designed for conversational multimodal voice agents.
+
+#### Architecture If Based on LiveKit
+```
+Candidate joins LiveKit room
+AI customer joins as agent participant
+CallCallum graph controls the agent
+candidate audio streams to STT
+matched graph route drives customer responses
+route/events stored to DB
+```
+
+#### What to Borrow
+Real phone-call feel, WebRTC transport, future telephony integration, production voice rooms, agent participant model.
+
+#### Downsides
+More infra than needed for a web MVP. You are building a web app, not a telephony platform — yet.
+
+#### Verdict
+**Best long-term production voice transport.** Do not use it to design the graph, but consider it when the call needs to feel production-grade.
+
+---
+
+### 5. NVIDIA voice-agent-examples — Reference Architecture / Low-Latency Patterns
+
+**Repo:** https://github.com/NVIDIA/voice-agent-examples
+**Stars:** ~1k | **License:** Apache 2.0
+
+#### What It Is
+Pipecat-based voice-agent examples from NVIDIA. Shows real-time voice-enabled multimodal conversational AI patterns with latency budgets, filler responses, and WebSocket/WebRTC patterns.
+
+#### What to Borrow
+Latency instrumentation, audio buffering patterns, filler/backchannel approach, real-time pipeline examples.
+
+#### Downsides
+May push toward NVIDIA-specific services/infrastructure. Useful as reference, not core dependency.
+
+#### Verdict
+**Good reference, not the main architecture.**
+
+---
+
+### 6. RealtimeVoiceChat / RealtimeTTS — Simple Local Voice Loop
+
+**Repos:** https://github.com/KoljaB/RealtimeVoiceChat | https://github.com/KoljaB/RealtimeTTS
+**Stars:** ~2k combined | **License:** MIT
+
+#### What It Is
+The "basic skeleton" for a voice loop: mic input → STT → LLM → TTS → playback. RealtimeTTS focuses on low-latency TTS compatible with LLM streams.
+
+#### Architecture If Based on It
+```
+RealtimeVoiceChat-style loop
+  → replace generic LLM response with CallCallum graph response
+  → replace generic chat memory with scenario state
+  → log matched nodes and evidence
+```
+
+#### Verdict
+**Best quick prototype reference.** Good for the audio lab, less for the final production engine.
+
+---
+
+### 7. BUD-E / natural_voice_assistant — Empathy / Natural Behaviour
+
+**Repo:** https://github.com/brendel-group/natural_voice_assistant
+**Stars:** ~1k | **License:** MIT
+
+#### What It Is
+Open-source empathic voice assistant. Backchannels ("mm-hm", "uh-huh"), interruptions, affirmations, natural pauses, emotional voice behaviour. Designed for local consumer-hardware operation.
+
+#### Architecture If Based on BUD-E
+```
+CallCallum graph determines what the customer knows/feels
+BUD-E-style behaviour layer determines how they say it
+TTS cache/preload handles speed
+```
+
+#### What to Borrow
+Backchannel model, human-like hesitation, emotional response layer, interruption behaviour, natural conversation UX.
+
+#### Verdict
+**Best inspiration for customer realism.** Use as a "behaviour layer" reference, not as the engine foundation.
+
+---
+
+### 8. Microsoft Bot Framework — Enterprise Dialogue / State (Historical)
+
+**Repos:** https://github.com/microsoft/botbuilder-js | https://github.com/microsoft/botbuilder-python
+**Samples:** https://github.com/microsoft/BotBuilder-Samples
+**License:** MIT
+
+#### What It Offers
+Conversation state, dialogs, waterfall steps, branching flows, turn context. Maps to scenario state, expected actions, branching support-call flow.
+
+#### Why Not to Use It
+Aging/archived — Bot Framework SDK/Emulator end-of-life December 2025. More enterprise bot platform than modern realtime voice sim.
+
+#### Verdict
+**Useful historical design pattern, not a dependency.** Borrow the dialog-state ideas only.
+
+---
+
+### 9. BotSIM (Salesforce) — Simulation / Evaluation / Remediation
+
+**Repo:** https://github.com/salesforce/BotSIM
+**Stars:** ~400 | **License:** BSD-3
+
+#### What It Is
+Open-source bot simulation toolkit for task-oriented dialogue systems. Dialog generation, user simulation, conversation analytics, evaluation, diagnosis, and remediation.
+
+#### Why It Is Underrated for CallCallum
+BotSIM's world: simulate users → test bots → analyse failures → diagnose paths → suggest remediation.
+
+Your world (inverted): simulate customer → test human → analyse failures → diagnose path → suggest training.
+
+Structurally very close.
+
+#### Architecture If Based on BotSIM
+```
+Scenario generator → simulated user/customer → candidate interaction
+                  → conversation analytics → failure diagnosis
+                  → remediation/training suggestion
+```
+
+#### Verdict
+**Best conceptual match for the assessment/analysis loop.** Rasa = best for dialogue graph. BotSIM = best for evaluate-diagnose-remediate cycle.
+
+---
+
+### Comparison Chart
+
+Subjective fit score for each project as a foundation for the MSP simulation engine (1-10):
+
+| Project | Graph | Latency | Voice Transport | Analysis | Assessment |
+|---------|-------|---------|-----------------|----------|------------|
+| **Rasa** | 9 | 3 | 2 | 5 | 4 |
+| **VoiceAgentRAG** | 4 | 10 | 3 | 3 | 2 |
+| **Pipecat** | 2 | 6 | 9 | 2 | 2 |
+| **LiveKit Agents** | 2 | 5 | 10 | 2 | 2 |
+| **NVIDIA voice-agent-examples** | 3 | 7 | 7 | 3 | 3 |
+| **RealtimeVoiceChat** | 1 | 5 | 5 | 1 | 1 |
+| **BUD-E** | 2 | 4 | 4 | 1 | 1 |
+| **Bot Framework** | 7 | 2 | 3 | 4 | 3 |
+| **BotSIM** | 5 | 2 | 1 | 8 | 9 |
+
+---
+
+### Alternative Architectures to Compare
+
+#### Architecture A — Rasa-style Graph Engine (Recommended Core)
+
+**Core idea:** CallCallum is a domain-specific dialogue graph engine.
+
+**Stack:** Custom TypeScript graph, intent matcher, scenario state, response templates, cached audio, event/evidence log.
+
+**Inspired by:** Rasa + Bot Framework.
+
+**Best for:** Deterministic scoring, route analysis, alternative paths, easy debugging, repeatable assessments.
+
+**Weakness:** Less natural if graph too rigid; needs LLM fallback for unexpected candidate behaviour.
+
+**Verdict: This should be the core sim model.**
+
+#### Architecture B — VoiceAgentRAG Predictive Cache Engine
+
+**Core idea:** CallCallum is a predictive response/audio cache.
+
+**Stack:** Background predictor, expected candidate path, semantic cache, preloaded audio, fast responder, LLM fallback.
+
+**Inspired by:** VoiceAgentRAG.
+
+**Best for:** Beating latency, preloading likely responses, feeling instant, making voice calls smooth.
+
+**Weakness:** Does not alone solve scenario graph or scoring.
+
+**Verdict: Combine with Architecture A.** Likely the best "beat Cartesia feeling" strategy.
+
+#### Architecture C — Pipecat/LiveKit Realtime Voice Runtime
+
+**Core idea:** CallCallum is a serious voice app with a separate realtime voice service.
+
+**Stack:** Next.js dashboard, Python Pipecat or LiveKit agent, STT/LLM/TTS streaming, graph runtime service, WebRTC/WebSocket audio.
+
+**Inspired by:** Pipecat + LiveKit + NVIDIA examples.
+
+**Best for:** Real-time voice quality, barge-in, streaming audio, future telephony, production-grade call feel.
+
+**Weakness:** More moving parts; could distract from hiring/analysis MVP.
+
+**Verdict: Great for voice lab / later production.** Not first priority inside CX-Train.
+
+#### Architecture D — BotSIM-style Evaluation/Remediation Engine
+
+**Core idea:** CallCallum is an assessment laboratory.
+
+**Stack:** Scenario, candidate route, failure diagnosis, alternative path comparison, training recommendation, manager correction loop.
+
+**Inspired by:** BotSIM.
+
+**Best for:** Analysis engine, training suggestions, manager feedback loop, moat.
+
+**Weakness:** Not a live voice solution.
+
+**Verdict: Should inspire the analysis engine.**
+
+#### Architecture E — Generic Realtime Voice Chat (Trap to Avoid)
+
+**Core idea:** CallCallum is basically voice chat with a prompted customer.
+
+**Stack:** Mic → STT → LLM → TTS → transcript → analysis.
+
+**Inspired by:** RealtimeVoiceChat / generic voice agents.
+
+**Best for:** Quick prototype, simple implementation.
+
+**Weakness:** Less deterministic, harder to score, more latency, less moat.
+
+**Verdict: Useful prototype, but not the final architecture. This is the trap to avoid.**
+
+---
+
+### The Architecture I Would Actually Choose
+
+The strongest hybrid:
+
+```
+Custom CallCallum Graph Engine
++ VoiceAgentRAG-style Predictive Audio Cache
++ Pipecat/LiveKit-style realtime voice transport (later)
++ BotSIM-style analysis/remediation loop
+```
+
+In one flow:
+
+```
+SimPack → Compiled Conversation Graph → Predictive Audio Manifest
+        → Runtime Intent Matcher → Customer Response Selector
+        → Scenario State Update → Evidence Event Log
+        → Route Analysis → Alternative Path Comparison
+        → Manager Review / Callum Recommendation
+```
+
+#### The Key Object
+
+```json
+{
+  "turn_id": "turn_004",
+  "candidate_text": "Are there emails stuck in your Outbox?",
+  "matched_intent": "ask_outbox_status",
+  "graph_node": "outlook_outbox_check",
+  "confidence": 0.91,
+  "customer_response_key": "outbox_has_three_emails_frustrated_v1",
+  "response_source": "cached_audio",
+  "state_update": { "outbox_checked": true },
+  "evidence_tags": [
+    "checked_outbox",
+    "followed_basic_email_troubleshooting"
+  ],
+  "ideal_path_position": 2,
+  "alternative_better_next_actions": [
+    "ask_if_internet_works",
+    "ask_about_send_receive_status"
+  ]
+}
+```
+
+The route taken through the graph becomes the transcript of competence — richer than words alone.
+
+#### What to Build Next
+
+A minimal CallCallum-native graph engine inspired by these projects. Not a wholesale framework adoption.
+
+```
+lib/mvp/sim-graph/
+  graph-types.ts         — intent, node, state, evidence types
+  compile-simpack-to-graph.ts — sim pack → conversation graph
+  intent-match.ts        — keyword → embedding → LLM classifier
+  response-cache.ts      — preloaded audio manifest manager
+  runtime.ts             — per-turn graph traversal loop
+  route-log.ts           — evidence event persistence
+  analysis.ts            — route vs ideal path comparison
+```
+
+First version:
+1. Take Outlook Work Offline sim pack.
+2. Compile 8–12 expected graph nodes.
+3. Add candidate phrase examples per node.
+4. Add customer response text per node.
+5. Cache/preload response audio if TTS available.
+6. On candidate message, match intent to node.
+7. Return graph response.
+8. Log route event.
+9. Show route on manager review page.
+10. Analysis compares route to ideal path.
+
+After the graph proves useful, Pipecat/LiveKit can replace the voice transport, VoiceAgentRAG can inspire background preloading, Rasa can inspire richer dialogue rules, and BotSIM can inspire remediation/analysis.
+
+---
+
 ## Mapped Features by Tool
 
 | Feature Group | Phase 1 | Phase 2 | Phase 3 | Phase 4 |
